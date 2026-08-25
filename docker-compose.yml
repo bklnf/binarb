@@ -1,0 +1,31 @@
+services:
+  binarb:
+    build: .
+    image: binarb:latest
+    container_name: binarb
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "binarb", "run"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tg-gateway:
+    build: .
+    image: binarb:latest
+    container_name: binarb_tg_gateway
+    restart: unless-stopped
+    profiles: ["operator"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "binarb.tg_gateway"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

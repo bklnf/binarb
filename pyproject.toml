@@ -1,0 +1,23 @@
+[project]
+name = "binarb"
+version = "0.1.0"
+description = "Durable Binance Spot triangular arbitrage service"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31,<3", "websocket-client>=1.8,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+binarb = "binarb.app:main"
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["binarb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
