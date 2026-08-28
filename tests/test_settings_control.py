@@ -1,9 +1,9 @@
 import pytest
 from decimal import Decimal
 
-from binarb.app import LIVE_ACK, Settings, portfolio_value_usd, status_text
+from binarb.app import LIVE_ACK, Settings, maintain_bnb_fee_reserve, portfolio_value_usd, status_text
 from binarb import control_plane as cp
-from binarb.models import PairMeta
+from binarb.models import Edge, Fill, PairMeta
 from binarb.tg_gateway import handle
 
 
@@ -53,5 +53,33 @@ def test_telegram_status_includes_total_usd(tmp_path, monkeypatch):
     monkeypatch.setenv("ARB_CONTROL_ROOT_BINANCE", str(tmp_path))
     cp.write_control(cp.RUNNING)
     text = status_text(Settings.load(), {"total_balance_usd": "123.45",
-        "unpriced_asset_count": 2})
+        "unpriced_asset_count": 2, "bnb_fee_discount_active": True})
     assert "💵 Total balance: ≈ $123.45 (2 unpriced assets)" in text
+    assert "💎 BNB fee discount: ON" in text
+
+
+def test_bnb_fee_reserve_replenishes_only_below_floor():
+    class Client:
+        def __init__(self): self.active, self.budget = None, None
+        def set_bnb_discount_active(self, active): self.active = active
+        def edge(self, source, target, tickers):
+            return Edge(source, target, "BNBUSDT", "buy", Decimal("600"), Decimal(0))
+        def prepare_market_order(self, edge, budget): return {"quoteOrderQty": str(budget)}
+        def new_market_order(self, edge, budget, token):
+            self.budget = budget
+            return Fill(1, token, "FILLED", "BNBUSDT", "BUY", Decimal(".013"), budget)
+
+    class SettingsStub:
+        use_bnb_fee_discount = True
+        bnb_replenish_enabled = True
+        bnb_replenish_floor_usdt = Decimal("3")
+        bnb_replenish_target_usdt = Decimal("10")
+        dry_run = False
+
+    client = Client()
+    active = maintain_bnb_fee_reserve(client, SettingsStub(),
+                                      {"BNBUSDT": (Decimal("600"), Decimal("601"))},
+                                      {"BNB": Decimal(".003"), "USDT": Decimal("12")})
+    assert active is False
+    assert client.active is False
+    assert client.budget == Decimal("8.2")

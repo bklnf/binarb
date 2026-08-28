@@ -64,3 +64,27 @@ def test_fill_aggregates_commissions_by_asset():
                   {"commissionAsset": "BNB", "commission": ".001"}]})
     assert fill.commission("A") == Decimal(".03")
     assert fill.commission("BNB") == Decimal(".001")
+
+
+def test_test_commission_applies_verified_bnb_discount():
+    response = Response({"standardCommissionForOrder": {"taker": "0.001"},
+                         "specialCommissionForOrder": {"taker": "0"},
+                         "taxCommissionForOrder": {"taker": "0"},
+                         "discount": {"enabledForAccount": True, "enabledForSymbol": True,
+                                      "discountAsset": "BNB", "discount": "0.75"}})
+    client = BinanceClient("key", "secret", session=Session([response]))
+    client.pairs = {"AUSDT": pair()}
+    edge = Edge("USDT", "A", "AUSDT", "buy", Decimal("10"), Decimal(".001"))
+    assert client.test_commission(edge, Decimal("5")) == Decimal(".00025")
+
+
+def test_test_commission_uses_base_rate_when_bnb_discount_is_disabled():
+    response = Response({"standardCommissionForOrder": {"taker": "0.001"},
+                         "specialCommissionForOrder": {"taker": "0"},
+                         "taxCommissionForOrder": {"taker": "0"},
+                         "discount": {"enabledForAccount": False, "enabledForSymbol": True,
+                                      "discount": "0.75"}})
+    client = BinanceClient("key", "secret", session=Session([response]))
+    client.pairs = {"AUSDT": pair()}
+    edge = Edge("USDT", "A", "AUSDT", "buy", Decimal("10"), Decimal(".001"))
+    assert client.test_commission(edge, Decimal("5")) == Decimal(".001")

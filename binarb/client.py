@@ -42,6 +42,9 @@ class BinanceClient:
         self._account_cache: dict | None = None
         self.pairs: dict[str, PairMeta] = {}
         self.fees: dict[str, Decimal] = {}
+        self.base_fees: dict[str, Decimal] = {}
+        self.bnb_fee_multiplier: Decimal | None = None
+        self.bnb_discount_active = False
 
     def _raise(self, response, endpoint: str, *, placement: bool = False):
         if response.ok:
@@ -129,17 +132,54 @@ class BinanceClient:
 
     def load_account_fees(self) -> dict[str, Decimal]:
         # /sapi/v1/asset/tradeFee is not reachable from every Binance region.
-        # The core account response supplies the account's taker tier. Applying
-        # it to every pair intentionally ignores zero-fee promotions and BNB
-        # discounts, making screening conservative. A shortlisted order is
-        # later checked with order/test computeCommissionRates.
+        # The core account response supplies the account's taker tier. Pair
+        # promotions are checked later with order/test; a verified BNB discount
+        # can be applied uniformly to screening fees by configure_bnb_discount.
         account = self.account()
         rate = _d((account.get("commissionRates") or {}).get("taker"),
                   _d(account.get("takerCommission")) / Decimal(10000))
         if not rate.is_finite() or not Decimal(0) <= rate <= Decimal("0.05"):
             raise BinanceError(f"invalid account taker fee {rate}", endpoint="account")
-        self.fees = {symbol: rate for symbol in self.pairs}
+        self.base_fees = {symbol: rate for symbol in self.pairs}
+        self.fees = dict(self.base_fees)
         return self.fees
+
+    def configure_bnb_discount(self, tickers: dict[str, tuple[Decimal, Decimal]], *, enabled: bool):
+        """Probe Binance once and apply its BNB fee discount to screening rates.
+
+        Binance exposes the account-wide BNB discount on an order/test response,
+        rather than the account commissionRates response. The probe is
+        non-executing; exact per-leg rates are still probed immediately before a
+        live triangle is submitted.
+        """
+        self.bnb_discount_active = False
+        self.bnb_fee_multiplier = None
+        self.fees = dict(self.base_fees)
+        if not enabled:
+            return None
+        for symbol in ("BTCUSDT", "ETHUSDT", "BNBUSDT"):
+            prices, meta = tickers.get(symbol), self.pairs.get(symbol)
+            if prices is None or meta is None or symbol not in self.base_fees:
+                continue
+            edge = Edge("USDT", meta.base, symbol, "buy", prices[1], self.base_fees[symbol])
+            amount = max(meta.min_notional, Decimal("5"))
+            try:
+                effective = self.test_commission(edge, amount)
+            except Exception:
+                continue
+            base = self.base_fees[symbol]
+            if base <= 0 or effective < 0 or effective > base:
+                continue
+            multiplier = effective / base
+            self.bnb_fee_multiplier = multiplier
+            self.fees = {name: rate * multiplier for name, rate in self.base_fees.items()}
+            return multiplier
+        return None
+
+    def set_bnb_discount_active(self, active: bool):
+        self.bnb_discount_active = bool(active and self.bnb_fee_multiplier is not None)
+        multiplier = self.bnb_fee_multiplier if self.bnb_discount_active else Decimal(1)
+        self.fees = {symbol: rate * multiplier for symbol, rate in self.base_fees.items()}
 
     def tickers(self) -> dict[str, tuple[Decimal, Decimal]]:
         rows = self.public("/api/v3/ticker/bookTicker")
@@ -278,9 +318,15 @@ class BinanceClient:
                   "newClientOrderId": "binarb-fee-probe", "computeCommissionRates": "true",
                   **self.prepare_market_order(edge, input_amount)}
         row = self.signed("POST", "/api/v3/order/test", params)
-        total = Decimal(0)
-        for name in ("standardCommissionForOrder", "specialCommissionForOrder",
-                     "taxCommissionForOrder"):
+        standard = _d((row.get("standardCommissionForOrder") or {}).get("taker"))
+        discount = row.get("discount") or {}
+        if discount.get("enabledForAccount") and discount.get("enabledForSymbol"):
+            discount_rate = _d(discount.get("discount"))
+            if not Decimal(0) <= discount_rate < Decimal(1):
+                raise BinanceError(f"invalid BNB commission discount {discount_rate}", endpoint="order/test")
+            standard *= Decimal(1) - discount_rate
+        total = standard
+        for name in ("specialCommissionForOrder", "taxCommissionForOrder"):
             total += _d((row.get(name) or {}).get("taker"))
         if not total.is_finite() or not Decimal(0) <= total <= Decimal("0.05"):
             raise BinanceError(f"invalid computed commission {total}", endpoint="order/test")

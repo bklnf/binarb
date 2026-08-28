@@ -61,6 +61,10 @@ class Settings:
     archive_max_files: int
     auto_recover: bool
     scan_log_interval_s: float
+    use_bnb_fee_discount: bool
+    bnb_replenish_enabled: bool
+    bnb_replenish_floor_usdt: Decimal
+    bnb_replenish_target_usdt: Decimal
 
     @classmethod
     def load(cls, *, permit_live=False):
@@ -82,6 +86,10 @@ class Settings:
             int(_env("ARB_ARCHIVE_MAX_FILES_BINANCE", "2000")),
             _bool("ARB_AUTO_RECOVER_BINANCE", True),
             float(_env("ARB_SCAN_LOG_INTERVAL_S_BINANCE", "10")),
+            _bool("ARB_USE_BNB_FEE_DISCOUNT_BINANCE", False),
+            _bool("ARB_BNB_REPLENISH_ENABLED_BINANCE", False),
+            Decimal(_env("ARB_BNB_REPLENISH_FLOOR_USDT_BINANCE", "3")),
+            Decimal(_env("ARB_BNB_REPLENISH_TARGET_USDT_BINANCE", "10")),
         )
         if not settings.start_currencies: raise ValueError("start currencies are empty")
         if settings.min_net_bps < 0 or not settings.min_net_bps.is_finite():
@@ -90,6 +98,9 @@ class Settings:
         if not Decimal(0) < settings.min_size_share <= 1: raise ValueError("min size share must be in (0,1]")
         if settings.max_slippage_bps < 0: raise ValueError("max slippage must be non-negative")
         if settings.scan_log_interval_s <= 0: raise ValueError("scan log interval must be positive")
+        if settings.bnb_replenish_floor_usdt < 0: raise ValueError("BNB replenish floor must be non-negative")
+        if settings.bnb_replenish_target_usdt < settings.bnb_replenish_floor_usdt:
+            raise ValueError("BNB replenish target must be at least its floor")
         if not dry_run and permit_live and _env("BINANCE_LIVE_ACK") != LIVE_ACK:
             raise RuntimeError(f"live mode requires BINANCE_LIVE_ACK={LIVE_ACK}")
         return settings
@@ -100,9 +111,58 @@ def make_client():
                          api_root=_env("BINANCE_API_ROOT", "https://api.binance.com"))
 
 
-def bootstrap(client):
+def bootstrap(client, settings=None):
     offset = client.sync_time()
-    return offset, client.load_pair_metadata(), client.load_account_fees()
+    pairs, fees = client.load_pair_metadata(), client.load_account_fees()
+    if settings and settings.use_bnb_fee_discount:
+        multiplier = client.configure_bnb_discount(client.tickers(), enabled=True)
+        logger.info("BNB fee screening multiplier=%s", multiplier)
+    return offset, pairs, fees
+
+
+def maintain_bnb_fee_reserve(client, settings, tickers, balances):
+    """Ensure BNB fee capacity before scanning; never run during a triangle."""
+    if not settings.use_bnb_fee_discount:
+        client.set_bnb_discount_active(False)
+        return False
+    prices = tickers.get("BNBUSDT")
+    if prices is None:
+        client.set_bnb_discount_active(False)
+        logger.warning("BNB fee reserve unavailable: no BNBUSDT ticker")
+        return False
+    bnb_value = balances.get("BNB", Decimal(0)) * prices[0]
+    if bnb_value >= settings.bnb_replenish_floor_usdt:
+        client.set_bnb_discount_active(True)
+        return True
+    client.set_bnb_discount_active(False)
+    if not settings.bnb_replenish_enabled or settings.dry_run:
+        logger.warning("BNB fee reserve below floor value_usdt=%s floor_usdt=%s", bnb_value,
+                       settings.bnb_replenish_floor_usdt)
+        return False
+    edge = client.edge("USDT", "BNB", tickers)
+    available = balances.get("USDT", Decimal(0))
+    budget = min(settings.bnb_replenish_target_usdt - bnb_value, available)
+    if edge is None or budget <= 0:
+        logger.warning("BNB fee replenish skipped: no usable USDT route or balance")
+        return False
+    try:
+        client.prepare_market_order(edge, budget)
+    except ValueError as exc:
+        logger.warning("BNB fee replenish skipped budget_usdt=%s: %s", budget, exc)
+        return False
+    token = f"barb-fee-bnb-{time.time_ns()}"[:36]
+    fill = client.new_market_order(edge, budget, token)
+    acquired = max(fill.volume - fill.commission("BNB"), Decimal(0))
+    logger.warning("BNB fee reserve replenished spent_usdt=%s acquired_bnb=%s target_usdt=%s",
+                   fill.cost, acquired, settings.bnb_replenish_target_usdt)
+    try:
+        from .telegram import send_message
+        send_message("💎 BNB fee reserve replenished\n"
+                     f"Spent: {fill.cost} USDT\nAcquired: {acquired} BNB\n"
+                     f"Target: ${settings.bnb_replenish_target_usdt}")
+    except Exception:
+        logger.exception("BNB fee replenish notification failed")
+    return False
 
 
 def portfolio_value_usd(client, tickers, balances, *, max_hops=3):
@@ -245,7 +305,7 @@ def run_once(client, settings, tickers, balances, *, permit_live, runtime=None):
 
 
 def probe(client, settings, *, validate=False):
-    offset, pairs, fees = bootstrap(client)
+    offset, pairs, fees = bootstrap(client, settings)
     balances, tickers = client.balances(), client.tickers()
     edges = build_edges(pairs, fees, tickers)
     print(f"time_offset_ms={offset} online_pairs={len(pairs)} fee_pairs={len(fees)} tickers={len(tickers)}")
@@ -281,12 +341,15 @@ def status_text(settings, runtime):
     total_text = f"💵 Total balance: ≈ ${total}"
     if unpriced:
         total_text += f" ({unpriced} unpriced assets)"
+    discount_text = "💎 BNB fee discount: " + (
+        "ON" if runtime.get("bnb_fee_discount_active") else "OFF")
     return "\n".join(("🔺 Binance triangle arb", f"Mode: {mode}",
         f"State: {state_icon} {desired.upper()}",
         total_text, f"💰 Starts: {','.join(settings.start_currencies)}",
         f"📈 Tickers: {runtime.get('tickers', 'n/a')}",
         f"🔄 Triangles: {runtime.get('triangles', 'n/a')}",
         f"🎯 Candidates: {runtime.get('ticker_candidates', 'n/a')}",
+        discount_text,
         f"🧾 Last decision: {runtime.get('last_decision', 'none')}",
         f"⚠️ Last error: {runtime.get('last_error', 'none')}"))
 
@@ -409,7 +472,7 @@ def main(argv=None):
                            max_usdt=args.max_usdt, recover_btc=args.recover_btc)
     if args.command == "stream-probe": return stream_probe(make_client())
     if args.command not in {"scan-once", "run"}: parser.print_help(); return 2
-    client = make_client(); offset, pairs, fees = bootstrap(client)
+    client = make_client(); offset, pairs, fees = bootstrap(client, settings)
     seed, balances = client.tickers(), client.balances()
     total_balances = client.total_balances()
     logger.info("bootstrap complete mode=%s time_offset_ms=%d online_pairs=%d fee_pairs=%d "
@@ -440,12 +503,18 @@ def main(argv=None):
                 time.sleep(min(settings.scan_interval_s, 1)); continue
             if now - last_seed >= settings.rest_seed_interval_s:
                 stream.seed(client.tickers()); last_seed = now
-            if now - balance_at >= 5:
+            refresh_balances = now - balance_at >= 5
+            if refresh_balances:
                 balances, balance_at = client.balances(), now
                 update_portfolio_runtime(runtime, client,
                                          stream.snapshot(max_age_s=settings.ticker_max_age_s),
                                          client.total_balances())
             fresh_tickers = stream.snapshot(max_age_s=settings.ticker_max_age_s)
+            if refresh_balances:
+                bnb_discount_active = maintain_bnb_fee_reserve(client, settings, fresh_tickers, balances)
+                runtime["bnb_fee_discount_active"] = bnb_discount_active
+                if not bnb_discount_active and settings.bnb_replenish_enabled and not settings.dry_run:
+                    balance_at = 0
             result = run_once(client, settings, fresh_tickers, balances,
                               permit_live=True, runtime=runtime)
             if result and not settings.dry_run: balance_at = 0
