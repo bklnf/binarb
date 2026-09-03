@@ -131,16 +131,27 @@ class BinanceClient:
         return result
 
     def load_account_fees(self) -> dict[str, Decimal]:
-        # /sapi/v1/asset/tradeFee is not reachable from every Binance region.
-        # The core account response supplies the account's taker tier. Pair
-        # promotions are checked later with order/test; a verified BNB discount
-        # can be applied uniformly to screening fees by configure_bnb_discount.
+        # Prefer Binance's symbol-specific rates so fee promotions are visible
+        # during screening.  Some regional API deployments deny this SAPI
+        # endpoint, in which case the account-wide taker tier is a conservative
+        # fallback.  BNB discount handling is applied separately below.
         account = self.account()
         rate = _d((account.get("commissionRates") or {}).get("taker"),
                   _d(account.get("takerCommission")) / Decimal(10000))
         if not rate.is_finite() or not Decimal(0) <= rate <= Decimal("0.05"):
             raise BinanceError(f"invalid account taker fee {rate}", endpoint="account")
         self.base_fees = {symbol: rate for symbol in self.pairs}
+        try:
+            rows = self.signed("GET", "/sapi/v1/asset/tradeFee")
+        except (AuthenticationError, BinanceError, requests.RequestException):
+            rows = ()
+        if not isinstance(rows, list):
+            rows = ()
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            taker = _d(row.get("takerCommission"), rate)
+            if symbol in self.base_fees and taker.is_finite() and Decimal(0) <= taker <= Decimal("0.05"):
+                self.base_fees[symbol] = taker
         self.fees = dict(self.base_fees)
         return self.fees
 
@@ -321,10 +332,13 @@ class BinanceClient:
         standard = _d((row.get("standardCommissionForOrder") or {}).get("taker"))
         discount = row.get("discount") or {}
         if discount.get("enabledForAccount") and discount.get("enabledForSymbol"):
-            discount_rate = _d(discount.get("discount"))
-            if not Decimal(0) <= discount_rate < Decimal(1):
-                raise BinanceError(f"invalid BNB commission discount {discount_rate}", endpoint="order/test")
-            standard *= Decimal(1) - discount_rate
+            # Binance calls this a discount but returns the *remaining-rate*
+            # multiplier: 0.75 means the normal rate is reduced by 25%, not
+            # that only 25% of it remains.
+            remaining_rate = _d(discount.get("discount"))
+            if not Decimal(0) <= remaining_rate <= Decimal(1):
+                raise BinanceError(f"invalid BNB commission multiplier {remaining_rate}", endpoint="order/test")
+            standard *= remaining_rate
         total = standard
         for name in ("specialCommissionForOrder", "taxCommissionForOrder"):
             total += _d((row.get(name) or {}).get("taker"))

@@ -21,6 +21,67 @@ class StateStore:
         self.archive_retention_days = int(archive_retention_days)
         self.archive_max_files = int(archive_max_files)
 
+    @property
+    def blocked_symbols_path(self):
+        # Keep this outside state/ so active() only ever returns deal records.
+        return self.directory.parent / "blocked_symbols.json"
+
+    def _read_blocked_symbols(self):
+        try:
+            data = json.loads(self.blocked_symbols_path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def blocked_symbols(self):
+        return frozenset(self._read_blocked_symbols())
+
+    def block_symbol(self, symbol, reason):
+        """Persist a symbol that Binance rejected for this account."""
+        symbol = str(symbol).upper()
+        if not symbol:
+            return False
+        entries = self._read_blocked_symbols()
+        if symbol in entries:
+            return False
+        self.blocked_symbols_path.parent.mkdir(parents=True, exist_ok=True)
+        entries[symbol] = {"blocked_at": time.time(), "reason": str(reason)}
+        payload = json.dumps(entries, indent=2, sort_keys=True)
+        fd, temporary = tempfile.mkstemp(prefix=".blocked_symbols.",
+                                         dir=self.blocked_symbols_path.parent)
+        try:
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.blocked_symbols_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return True
+
+    def seed_blocked_symbols_from_archive(self):
+        """Migrate previously observed account-restricted symbols once."""
+        if not self.archive.exists():
+            return frozenset()
+        added = set()
+        marker = "symbol is not permitted for this account"
+        for path in self.archive.glob("*.json"):
+            try:
+                state = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if marker not in str(state.get("error", "")).lower():
+                continue
+            rejected = next((order for order in reversed(state.get("orders", ()))
+                             if order.get("status") == "SUBMITTING" and order.get("symbol")), None)
+            if rejected and self.block_symbol(rejected["symbol"], state["error"]):
+                added.add(str(rejected["symbol"]).upper())
+        return frozenset(added)
+
     def path(self, deal_id):
         return self.directory / f"{deal_id}.json"
 

@@ -113,11 +113,12 @@ def make_client():
 
 def bootstrap(client, settings=None):
     offset = client.sync_time()
-    pairs, fees = client.load_pair_metadata(), client.load_account_fees()
+    pairs = client.load_pair_metadata()
+    client.load_account_fees()
     if settings and settings.use_bnb_fee_discount:
         multiplier = client.configure_bnb_discount(client.tickers(), enabled=True)
         logger.info("BNB fee screening multiplier=%s", multiplier)
-    return offset, pairs, fees
+    return offset, pairs, client.fees
 
 
 def maintain_bnb_fee_reserve(client, settings, tickers, balances):
@@ -210,8 +211,8 @@ def update_portfolio_runtime(runtime, client, tickers, balances):
     runtime["unpriced_asset_count"] = len(unpriced)
 
 
-def find_best(client, settings, tickers, balances):
-    edges = build_edges(client.pairs, client.fees, tickers)
+def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset()):
+    edges = build_edges(client.pairs, client.fees, tickers, blocked_symbols=blocked_symbols)
     best, best_score = None, None
     stats = {"tickers": len(tickers), "ticker_candidates": 0, "book_candidates": 0,
              "book_rejections": 0, "triangles": 0, "best_signal_bps": None,
@@ -277,11 +278,19 @@ def _store(settings):
 def run_once(client, settings, tickers, balances, *, permit_live, runtime=None):
     store = _store(settings)
     if store.active(): raise RuntimeError("unresolved deal blocks new entries")
-    candidate, stats = find_best(client, settings, tickers, balances)
+    should_seed = runtime is None or not runtime.get("_blocked_symbols_seeded")
+    seeded = store.seed_blocked_symbols_from_archive() if should_seed else frozenset()
+    blocked_symbols = store.blocked_symbols()
+    candidate, stats = find_best(client, settings, tickers, balances,
+                                 blocked_symbols=blocked_symbols)
     if runtime is not None:
         runtime.update(stats)
         runtime["last_scan_at"] = time.time()
         runtime["scan_count"] = int(runtime.get("scan_count", 0)) + 1
+        runtime["blocked_symbols"] = len(blocked_symbols)
+        runtime["_blocked_symbols_seeded"] = True
+        if seeded:
+            logger.warning("blocked historical account-restricted symbols=%s", ",".join(sorted(seeded)))
     if candidate is None:
         if runtime is not None: runtime["last_decision"] = "NO_FEASIBLE_OPPORTUNITY"
         return None

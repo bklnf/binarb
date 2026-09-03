@@ -4,6 +4,7 @@ from decimal import Decimal
 from binarb.app import LIVE_ACK, Settings, maintain_bnb_fee_reserve, portfolio_value_usd, status_text
 from binarb import control_plane as cp
 from binarb.models import Edge, Fill, PairMeta
+from binarb.state import StateStore
 from binarb.tg_gateway import handle
 
 
@@ -83,3 +84,14 @@ def test_bnb_fee_reserve_replenishes_only_below_floor():
     assert active is False
     assert client.active is False
     assert client.budget == Decimal("8.2")
+
+
+def test_account_restricted_symbols_are_persisted_and_seeded_from_history(tmp_path):
+    store = StateStore(tmp_path / "state")
+    state = {"deal_id": "old", "status": "RECOVERED",
+             "error": "BinanceError: This symbol is not permitted for this account.",
+             "orders": [{"symbol": "DOGSUSDC", "status": "FILLED"},
+                        {"symbol": "DOGSIDR", "status": "SUBMITTING"}]}
+    store.finish("old", state)
+    assert store.seed_blocked_symbols_from_archive() == frozenset({"DOGSIDR"})
+    assert store.blocked_symbols() == frozenset({"DOGSIDR"})

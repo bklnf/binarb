@@ -9,9 +9,12 @@ BPS = Decimal(10000)
 
 
 def build_edges(pairs: dict[str, PairMeta], fees: dict[str, Decimal],
-                tickers: dict[str, tuple[Decimal, Decimal]]) -> dict[tuple[str, str], Edge]:
+                tickers: dict[str, tuple[Decimal, Decimal]], *,
+                blocked_symbols=frozenset()) -> dict[tuple[str, str], Edge]:
     edges = {}
     for symbol, meta in pairs.items():
+        if symbol in blocked_symbols:
+            continue
         prices, fee = tickers.get(symbol), fees.get(symbol)
         if prices is None or fee is None:
             continue

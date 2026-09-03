@@ -75,7 +75,16 @@ def test_test_commission_applies_verified_bnb_discount():
     client = BinanceClient("key", "secret", session=Session([response]))
     client.pairs = {"AUSDT": pair()}
     edge = Edge("USDT", "A", "AUSDT", "buy", Decimal("10"), Decimal(".001"))
-    assert client.test_commission(edge, Decimal("5")) == Decimal(".00025")
+    assert client.test_commission(edge, Decimal("5")) == Decimal(".00075")
+
+
+def test_load_account_fees_prefers_symbol_specific_taker_rates():
+    client = BinanceClient("key", "secret", session=Session([
+        Response([{"symbol": "AUSDT", "takerCommission": "0.0004"}]),
+    ]))
+    client.pairs = {"AUSDT": pair(), "BUSDT": replace(pair(), symbol="BUSDT", base="B")}
+    client.account = lambda: {"commissionRates": {"taker": "0.001"}}
+    assert client.load_account_fees() == {"AUSDT": Decimal(".0004"), "BUSDT": Decimal(".001")}
 
 
 def test_test_commission_uses_base_rate_when_bnb_discount_is_disabled():

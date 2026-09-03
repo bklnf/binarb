@@ -53,6 +53,14 @@ def test_screen_reports_best_signal_even_below_execution_threshold():
     assert best_bps is not None and best_bps < Decimal("100")
 
 
+def test_blocked_symbol_is_excluded_from_graph():
+    pairs = {"AUSD": meta("AUSD", "A", "USD")}
+    edges = build_edges(pairs, {"AUSD": Decimal(".001")},
+                        {"AUSD": (Decimal("1"), Decimal("1.01"))},
+                        blocked_symbols={"AUSD"})
+    assert edges == {}
+
+
 def test_conservative_grid_matches_lazy_arb_half_balance_policy():
     assert conservative_size_grid(Decimal("100"), Decimal("10")) == [
         Decimal("50"), Decimal("25"), Decimal("12.5"), Decimal("10")]

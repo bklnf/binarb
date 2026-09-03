@@ -52,10 +52,16 @@ class Executor:
         amount = opportunity.start_amount
         try:
             # Exact side-specific fee probes are non-executing and also verify
-            # TRADE permission immediately before exposure is created.
+            # commission configuration immediately before exposure is created.
+            # A successful order/test is not proof that a live order is
+            # permitted for a regionally restricted symbol.
             exact_edges_list, projected = [], amount
             for edge in opportunity.edges:
-                fee = self.client.test_commission(edge, projected)
+                try:
+                    fee = self.client.test_commission(edge, projected)
+                except BinanceError as exc:
+                    self._block_if_account_restricted(state, edge, exc)
+                    raise
                 exact = type(edge)(edge.source, edge.target, edge.symbol, edge.side,
                                    edge.price, fee)
                 exact_edges_list.append(exact)
@@ -105,8 +111,14 @@ class Executor:
             if not self._recover_to_start(deal_id, state, opportunity.route[0]):
                 raise RecoveryRequired("residual inventory could not be flattened")
             end = Decimal(str(state["inventory"].get(opportunity.route[0], amount)))
+            gross_pnl = end - Decimal(str(state["actual_start_spent"]))
+            external_fee_value, unvalued_fees = self._external_commission_value(
+                state, opportunity.route[0])
             state.update(status="COMPLETE_WITH_DUST" if state.get("residual_dust") else "COMPLETE",
-                         end_amount=end, realized_pnl=end - Decimal(str(state["actual_start_spent"])),
+                         end_amount=end, realized_pnl_before_external_commissions=gross_pnl,
+                         external_commission_value_in_start=external_fee_value,
+                         unvalued_external_commissions=unvalued_fees,
+                         realized_pnl=(None if unvalued_fees else gross_pnl - external_fee_value),
                          completed_at=time.time())
             self.state_store.finish(deal_id, state)
             logger.warning("execution complete deal_id=%s route=%s status=%s start_spent=%s "
@@ -154,8 +166,12 @@ class Executor:
                             "remaining=%s reason=%s", deal_id, leg, policy, edge.symbol,
                             remaining, exc)
                 continue
-            fill = self._place_and_resolve(deal_id, f"{leg}-{policy.lower()}", edge,
-                                           remaining, state, policy=policy, price=price)
+            try:
+                fill = self._place_and_resolve(deal_id, f"{leg}-{policy.lower()}", edge,
+                                               remaining, state, policy=policy, price=price)
+            except BinanceError as exc:
+                self._block_if_account_restricted(state, edge, exc)
+                raise
             output = max((fill.volume if edge.side == "buy" else fill.cost)
                          - fill.commission(edge.target), Decimal(0))
             spent = ((fill.cost if edge.side == "buy" else fill.volume)
@@ -168,11 +184,52 @@ class Executor:
             remaining = max(Decimal(amount) - spent_total, Decimal(0))
             state["orders"][-1].update(input_spent=spent, net_output=output,
                                         input_remaining=remaining)
+            self._record_commissions(state, fill, edge)
             self.state_store.save(deal_id, state)
             logger.warning("leg attempt deal_id=%s leg=%s policy=%s symbol=%s status=%s "
                            "input_spent=%s net_output=%s remaining=%s",
                            deal_id, leg, policy, edge.symbol, fill.status, spent, output, remaining)
         return spent_total, output_total
+
+    def _block_if_account_restricted(self, state, edge, exc):
+        if "symbol is not permitted for this account" not in str(exc).lower():
+            return
+        if self.state_store.block_symbol(edge.symbol, str(exc)):
+            logger.critical("symbol blocked after Binance account rejection symbol=%s", edge.symbol)
+        state.setdefault("blocked_symbols", []).append(edge.symbol)
+
+    @staticmethod
+    def _record_commissions(state, fill, edge):
+        """Separate route-asset fees from fees debited in a third asset (BNB)."""
+        totals = state.setdefault("commissions", {})
+        external = state.setdefault("external_commissions", {})
+        for asset, amount in fill.commissions:
+            value = Decimal(str(amount))
+            totals[asset] = Decimal(str(totals.get(asset, 0))) + value
+            if asset not in {edge.source, edge.target}:
+                external[asset] = Decimal(str(external.get(asset, 0))) + value
+
+    def _external_commission_value(self, state, start):
+        """Value BNB (or another third-asset) commissions in the start asset."""
+        external = {asset: Decimal(str(amount)) for asset, amount
+                    in state.get("external_commissions", {}).items() if Decimal(str(amount)) > 0}
+        if not external:
+            return Decimal(0), {}
+        try:
+            tickers = self.client.tickers()
+        except Exception:
+            return Decimal(0), external
+        value, unvalued = Decimal(0), {}
+        for asset, amount in external.items():
+            if asset == start:
+                value += amount
+                continue
+            edge = self.client.edge(asset, start, tickers)
+            if edge is None:
+                unvalued[asset] = amount
+                continue
+            value += amount / edge.price if edge.side == "buy" else amount * edge.price
+        return value, unvalued
 
     def _place_and_resolve(self, deal_id, leg, edge, amount, state, *, policy="MARKET", price=None):
         cid = client_id(deal_id, leg)
@@ -269,6 +326,7 @@ class Executor:
                 output = max((fill.volume if edge.side == "buy" else fill.cost)
                              - fill.commission(edge.target), Decimal(0))
                 spent = (fill.cost if edge.side == "buy" else fill.volume) + fill.commission(edge.source)
+                self._record_commissions(state, fill, edge)
                 self._update_inventory(state, edge, spent, output)
                 logger.warning("recovery fill deal_id=%s asset=%s target=%s order_id=%s "
                                "input_spent=%s net_output=%s",
