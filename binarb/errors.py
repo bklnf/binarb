@@ -11,7 +11,9 @@ class AuthenticationError(BinanceError):
 
 
 class RateLimitError(BinanceError):
-    pass
+    def __init__(self, message, *, retry_after_s=None, **kwargs):
+        super().__init__(message, **kwargs)
+        self.retry_after_s = retry_after_s
 
 
 class AmbiguousOrderError(BinanceError):

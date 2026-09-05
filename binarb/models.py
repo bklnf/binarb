@@ -21,6 +21,9 @@ class PairMeta:
     price_tick: Decimal = Decimal(0)
     min_price: Decimal = Decimal(0)
     max_price: Decimal = Decimal(0)
+    min_notional_apply_market: bool = True
+    max_notional_apply_market: bool = True
+    quote_order_qty_market_allowed: bool = True
 
 
 @dataclass(frozen=True)

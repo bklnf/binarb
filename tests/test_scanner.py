@@ -2,7 +2,8 @@ from decimal import Decimal
 
 from binarb.models import Book, Edge, Level, PairMeta
 from binarb.scanner import (build_edges, discover_triangles, screen_top_of_book,
-                            conservative_size_grid, simulate,
+                            best_size_detailed, conservative_size_grid,
+                            route_minimum_start, simulate,
                             top_of_book_opportunities)
 
 
@@ -61,7 +62,43 @@ def test_blocked_symbol_is_excluded_from_graph():
     assert edges == {}
 
 
-def test_conservative_grid_matches_lazy_arb_half_balance_policy():
-    assert conservative_size_grid(Decimal("100"), Decimal("10")) == [
-        Decimal("50"), Decimal("25"), Decimal("12.5"), Decimal("10")]
+def test_excluded_bridge_asset_is_excluded_from_graph():
+    pairs = {"AIDR": meta("AIDR", "A", "IDR")}
+    edges = build_edges(pairs, {"AIDR": Decimal(".001")},
+                        {"AIDR": (Decimal("1"), Decimal("1.01"))},
+                        excluded_assets={"IDR"})
+    assert edges == {}
+
+
+def test_conservative_grid_is_dense_with_full_balance_ceiling_and_exact_floor():
+    grid = conservative_size_grid(Decimal("100"), Decimal("10"))
+    assert len(grid) == 16
+    assert grid[0] == Decimal("100")
+    assert grid[-1] == Decimal("10")
+    assert all(left > right for left, right in zip(grid, grid[1:]))
     assert conservative_size_grid(Decimal("10"), Decimal("10")) == [Decimal("10")]
+
+
+def test_route_minimum_accounts_for_later_leg_notional():
+    pairs = {"AUSD": meta("AUSD", "A", "USD", notional="1"),
+             "AB": meta("AB", "A", "B", notional="5"),
+             "BUSD": meta("BUSD", "B", "USD", notional="1")}
+    edges = (Edge("USD", "A", "AUSD", "buy", Decimal("1"), Decimal(0)),
+             Edge("A", "B", "AB", "sell", Decimal("1"), Decimal(0)),
+             Edge("B", "USD", "BUSD", "sell", Decimal("1"), Decimal(0)))
+    assert route_minimum_start(edges, pairs) == Decimal("5.05")
+
+
+def test_detailed_sizing_exposes_pair_rule_rejection():
+    pairs = {"AUSD": meta("AUSD", "A", "USD", notional="5"),
+             "AB": meta("AB", "A", "B", notional="5"),
+             "BUSD": meta("BUSD", "B", "USD", notional="5")}
+    edges = (Edge("USD", "A", "AUSD", "buy", Decimal("1"), Decimal(0)),
+             Edge("A", "B", "AB", "sell", Decimal("1"), Decimal(0)),
+             Edge("B", "USD", "BUSD", "sell", Decimal("1"), Decimal(0)))
+    books = {symbol: Book((Level(Decimal("1"), Decimal("100")),),
+                          (Level(Decimal("1"), Decimal("100")),)) for symbol in pairs}
+    candidate, diagnostic = best_size_detailed(
+        edges, books, pairs, Decimal("1"), Decimal("4"), Decimal(0))
+    assert candidate is None
+    assert diagnostic["code"] == "PAIR_RULES"

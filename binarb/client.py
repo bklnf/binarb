@@ -55,7 +55,13 @@ class BinanceClient:
         except ValueError:
             code, message = None, f"HTTP {response.status_code}"
         if response.status_code in {418, 429}:
-            raise RateLimitError(message, code=code, endpoint=endpoint)
+            raw_retry = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+            try:
+                retry_after = max(float(raw_retry), 1.0) if raw_retry is not None else 60.0
+            except (TypeError, ValueError):
+                retry_after = 60.0
+            raise RateLimitError(message, code=code, endpoint=endpoint,
+                                 retry_after_s=retry_after)
         if code in {-2014, -2015, -1022}:
             raise AuthenticationError(message, code=code, endpoint=endpoint)
         # Binance documents 5xx and -1007 placement outcomes as UNKNOWN.
@@ -112,6 +118,9 @@ class BinanceClient:
             price_filter = self._filter(row, "PRICE_FILTER")
             min_notional = _d(notional.get("minNotional") or minimum.get("minNotional"))
             maximum = _d(notional.get("maxNotional")) if notional.get("maxNotional") else None
+            min_apply_market = (notional.get("applyMinToMarket") if notional else
+                                minimum.get("applyToMarket"))
+            max_apply_market = notional.get("applyMaxToMarket") if notional else False
             meta = PairMeta(
                 symbol=row["symbol"], base=row["baseAsset"], quote=row["quoteAsset"],
                 base_step=_d(lot.get("stepSize")), min_qty=_d(lot.get("minQty")),
@@ -122,6 +131,11 @@ class BinanceClient:
                 price_tick=_d(price_filter.get("tickSize")),
                 min_price=_d(price_filter.get("minPrice")),
                 max_price=_d(price_filter.get("maxPrice")),
+                min_notional_apply_market=(True if min_apply_market is None
+                                           else bool(min_apply_market)),
+                max_notional_apply_market=bool(max_apply_market),
+                quote_order_qty_market_allowed=bool(
+                    row.get("quoteOrderQtyMarketAllowed", False)),
             )
             if meta.base_step > 0 and meta.market_step >= 0:
                 result[meta.symbol] = meta
@@ -252,24 +266,31 @@ class BinanceClient:
             quote_step = Decimal(1).scaleb(-min(meta.quote_precision, 8))
             quote = self._down(amount, quote_step)
             estimated_qty = quote / edge.price
-            if quote < meta.min_notional:
+            if meta.min_notional_apply_market and quote < meta.min_notional:
                 raise ValueError(f"{edge.symbol} quote {quote} below min notional {meta.min_notional}")
-            if meta.max_notional is not None and quote > meta.max_notional:
+            if (meta.max_notional_apply_market and meta.max_notional is not None
+                    and quote > meta.max_notional):
                 raise ValueError(f"{edge.symbol} quote {quote} above max notional {meta.max_notional}")
             if meta.market_min_qty and estimated_qty < meta.market_min_qty:
                 raise ValueError(f"{edge.symbol} estimated quantity below market minimum")
             if meta.market_max_qty and estimated_qty > meta.market_max_qty:
                 raise ValueError(f"{edge.symbol} estimated quantity above market maximum")
-            return {"quoteOrderQty": _plain(quote)}
+            if meta.quote_order_qty_market_allowed:
+                return {"quoteOrderQty": _plain(quote)}
+            quantity = self._down(estimated_qty, meta.market_step or meta.base_step)
+            if quantity < (meta.market_min_qty or meta.min_qty):
+                raise ValueError(f"{edge.symbol} quantity {quantity} below market minimum")
+            return {"quantity": _plain(quantity)}
         quantity = self._down(amount, meta.market_step or meta.base_step)
         if quantity < (meta.market_min_qty or meta.min_qty):
             raise ValueError(f"{edge.symbol} quantity {quantity} below market minimum")
         if meta.market_max_qty and quantity > meta.market_max_qty:
             raise ValueError(f"{edge.symbol} quantity {quantity} above market maximum")
         notional = quantity * edge.price
-        if notional < meta.min_notional:
+        if meta.min_notional_apply_market and notional < meta.min_notional:
             raise ValueError(f"{edge.symbol} notional {notional} below minimum {meta.min_notional}")
-        if meta.max_notional is not None and notional > meta.max_notional:
+        if (meta.max_notional_apply_market and meta.max_notional is not None
+                and notional > meta.max_notional):
             raise ValueError(f"{edge.symbol} notional {notional} above maximum {meta.max_notional}")
         return {"quantity": _plain(quantity)}
 

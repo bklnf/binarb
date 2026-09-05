@@ -4,12 +4,13 @@ import hashlib
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
 import requests
 
 from .errors import AmbiguousOrderError, BinanceError, RecoveryRequired
-from .scanner import best_size
+from .scanner import best_size, route_minimum_start
 
 
 logger = logging.getLogger(__name__)
@@ -68,10 +69,13 @@ class Executor:
                 projected = (projected / edge.price if edge.side == "buy"
                              else projected * edge.price) * (Decimal(1) - fee)
             exact_edges = tuple(exact_edges_list)
-            books = {edge.symbol: self.client.order_book(edge.symbol) for edge in exact_edges}
+            symbols = sorted({edge.symbol for edge in exact_edges})
+            with ThreadPoolExecutor(max_workers=min(3, len(symbols))) as pool:
+                books = dict(zip(symbols, pool.map(self.client.order_book, symbols)))
             fresh_available = (self.client.balances().get(opportunity.route[0], Decimal(0))
                                * self.balance_share)
-            minimum = fresh_available * self.min_size_share
+            minimum = max(fresh_available * self.min_size_share,
+                          route_minimum_start(exact_edges, self.client.pairs))
             repriced = best_size(exact_edges, books, self.client.pairs, minimum,
                                  fresh_available, self.min_net_bps)
             if (repriced is None or repriced.net_bps < self.min_net_bps or
@@ -137,10 +141,24 @@ class Executor:
                          error=f"{type(exc).__name__}: {exc}")
             self.state_store.save(deal_id, state)
             if self.auto_recover and self._recover_to_start(deal_id, state, opportunity.route[0]):
+                realized = None
+                if state.get("actual_start_spent") is not None:
+                    end = Decimal(str(state.get("inventory", {}).get(
+                        opportunity.route[0], 0)))
+                    gross = end - Decimal(str(state["actual_start_spent"]))
+                    external_fee_value, unvalued_fees = self._external_commission_value(
+                        state, opportunity.route[0])
+                    realized = None if unvalued_fees else gross - external_fee_value
+                    state.update(end_amount=end,
+                                 realized_pnl_before_external_commissions=gross,
+                                 external_commission_value_in_start=external_fee_value,
+                                 unvalued_external_commissions=unvalued_fees,
+                                 realized_pnl=realized)
                 state.update(status="RECOVERED", completed_at=time.time())
                 self.state_store.finish(deal_id, state)
-                logger.exception("execution failed and recovered deal_id=%s route=%s",
-                                 deal_id, "->".join(opportunity.route))
+                logger.exception("execution failed and recovered deal_id=%s route=%s "
+                                 "realized_pnl=%s",
+                                 deal_id, "->".join(opportunity.route), realized)
             else:
                 state["status"] = "RECOVERY_REQUIRED"
                 self.state_store.save(deal_id, state)

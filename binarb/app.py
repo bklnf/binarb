@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import shlex
@@ -12,9 +13,10 @@ from pathlib import Path
 from . import control_plane as cp
 from .client import BinanceClient
 from .executor import Executor, client_id
+from .errors import RateLimitError
 from .market_stream import BookTickerStream
-from .scanner import (build_edges, best_size, discover_triangles,
-                      screen_top_of_book, top_of_book_opportunities)
+from .scanner import (best_size, best_size_detailed, build_edges, discover_triangles,
+                      route_minimum_start, screen_top_of_book, top_of_book_opportunities)
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,7 @@ def _bool(name, default):
 @dataclass(frozen=True)
 class Settings:
     start_currencies: tuple[str, ...]
+    excluded_assets: frozenset[str]
     dry_run: bool
     min_net_bps: Decimal
     balance_share: Decimal
@@ -65,6 +68,8 @@ class Settings:
     bnb_replenish_enabled: bool
     bnb_replenish_floor_usdt: Decimal
     bnb_replenish_target_usdt: Decimal
+    confirmation_candidates_per_start: int
+    confirmation_candidates_total: int
 
     @classmethod
     def load(cls, *, permit_live=False):
@@ -73,13 +78,17 @@ class Settings:
             tuple(dict.fromkeys(item.strip().upper() for item in _env(
                 "ARB_START_CURRENCIES_BINANCE",
                 "USDT,USDC,FDUSD,BTC,ETH,BNB,EUR,TRY,BRL,JPY,MXN,ZAR"
-            ).split(",") if item.strip())), dry_run,
+            ).split(",") if item.strip())),
+            frozenset(item.strip().upper() for item in _env(
+                "ARB_EXCLUDED_ASSETS_BINANCE", "IDR"
+            ).split(",") if item.strip()),
+            dry_run,
             Decimal(_env("ARB_MIN_NET_BPS_BINANCE", "10")),
             Decimal(_env("BALANCE_SHARE_TO_BID_BINANCE", "1.00")),
             Decimal(_env("ARB_MIN_SIZE_SHARE_BINANCE", "0.10")),
             Decimal(_env("ARB_MAX_SLIPPAGE_BPS_BINANCE", "15")),
             float(_env("ARB_SCAN_INTERVAL_MS_BINANCE", "100")) / 1000,
-            float(_env("ARB_TICKER_MAX_AGE_S_BINANCE", "30")),
+            float(_env("ARB_TICKER_MAX_AGE_S_BINANCE", "2")),
             float(_env("ARB_REST_SEED_INTERVAL_S_BINANCE", "15")),
             _env("ARB_STATE_DIR_BINANCE", "data/state"),
             int(_env("ARB_ARCHIVE_RETENTION_DAYS_BINANCE", "30")),
@@ -90,6 +99,8 @@ class Settings:
             _bool("ARB_BNB_REPLENISH_ENABLED_BINANCE", False),
             Decimal(_env("ARB_BNB_REPLENISH_FLOOR_USDT_BINANCE", "3")),
             Decimal(_env("ARB_BNB_REPLENISH_TARGET_USDT_BINANCE", "10")),
+            int(_env("ARB_CONFIRMATION_CANDIDATES_PER_START_BINANCE", "3")),
+            int(_env("ARB_CONFIRMATION_CANDIDATES_TOTAL_BINANCE", "12")),
         )
         if not settings.start_currencies: raise ValueError("start currencies are empty")
         if settings.min_net_bps < 0 or not settings.min_net_bps.is_finite():
@@ -101,6 +112,10 @@ class Settings:
         if settings.bnb_replenish_floor_usdt < 0: raise ValueError("BNB replenish floor must be non-negative")
         if settings.bnb_replenish_target_usdt < settings.bnb_replenish_floor_usdt:
             raise ValueError("BNB replenish target must be at least its floor")
+        if settings.confirmation_candidates_per_start <= 0:
+            raise ValueError("confirmation candidates per start must be positive")
+        if settings.confirmation_candidates_total <= 0:
+            raise ValueError("total confirmation candidates must be positive")
         if not dry_run and permit_live and _env("BINANCE_LIVE_ACK") != LIVE_ACK:
             raise RuntimeError(f"live mode requires BINANCE_LIVE_ACK={LIVE_ACK}")
         return settings
@@ -212,12 +227,16 @@ def update_portfolio_runtime(runtime, client, tickers, balances):
 
 
 def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset()):
-    edges = build_edges(client.pairs, client.fees, tickers, blocked_symbols=blocked_symbols)
+    edges = build_edges(client.pairs, client.fees, tickers,
+                        blocked_symbols=blocked_symbols,
+                        excluded_assets=settings.excluded_assets)
     best, best_score = None, None
     stats = {"tickers": len(tickers), "ticker_candidates": 0, "book_candidates": 0,
              "book_rejections": 0, "triangles": 0, "best_signal_bps": None,
-             "best_signal_route": None,
+             "best_signal_route": None, "confirmed_candidates": 0,
+             "rejection_codes": {},
              "balances": {a: str(balances.get(a, 0)) for a in settings.start_currencies}}
+    pending = []
     for start in settings.start_currencies:
         available = balances.get(start, Decimal(0)); cap = available * settings.balance_share
         if cap <= 0: continue
@@ -228,45 +247,72 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
             stats["best_signal_bps"] = raw_best_bps
             stats["best_signal_route"] = start
         stats["ticker_candidates"] += len(signals)
-        for signal in signals[:10]:
-            logger.info("ticker candidate route=%s signal_net_bps=%.4f signal_profit=%s",
-                        "->".join(signal.route), signal.net_bps, signal.profit)
-            try:
-                books = {edge.symbol: client.order_book(edge.symbol) for edge in signal.edges}
-                candidate = best_size(signal.edges, books, client.pairs,
-                                      cap * settings.min_size_share, cap, settings.min_net_bps)
-            except Exception as exc:
-                logger.warning("depth check failed for %s: %s", "->".join(signal.route), exc)
-                stats["book_rejections"] += 1
-                continue
-            if candidate is None:
-                stats["book_rejections"] += 1
-                logger.info("opportunity decision route=%s decision=SKIPPED code=NO_FEASIBLE_SIZE",
-                            "->".join(signal.route))
-                continue
-            disagreement = abs(signal.net_bps - candidate.net_bps)
-            if disagreement > settings.max_slippage_bps:
-                stats["book_rejections"] += 1
-                logger.info("opportunity decision route=%s decision=SKIPPED "
-                            "code=FEED_DISAGREEMENT signal_net_bps=%.4f book_net_bps=%.4f",
-                            "->".join(signal.route), signal.net_bps, candidate.net_bps)
-                continue
-            stats["book_candidates"] += 1
-            logger.info("opportunity decision route=%s decision=ELIGIBLE size=%s "
+        pending.extend((signal, cap) for signal in
+                       signals[:settings.confirmation_candidates_per_start])
+
+    # Confirm the strongest signals first. Each route's three unique books are
+    # fetched concurrently, and rotations reuse books within this scan.
+    pending.sort(key=lambda item: item[0].net_bps, reverse=True)
+    pending = pending[:settings.confirmation_candidates_total]
+    book_cache = {}
+    for signal, cap in pending:
+        logger.info("ticker candidate route=%s signal_net_bps=%.4f signal_profit=%s",
+                    "->".join(signal.route), signal.net_bps, signal.profit)
+        try:
+            missing = sorted({edge.symbol for edge in signal.edges} - book_cache.keys())
+            if missing:
+                with ThreadPoolExecutor(max_workers=min(3, len(missing))) as pool:
+                    fetched = dict(zip(missing, pool.map(client.order_book, missing)))
+                book_cache.update(fetched)
+            books = {edge.symbol: book_cache[edge.symbol] for edge in signal.edges}
+            minimum = max(cap * settings.min_size_share,
+                          route_minimum_start(signal.edges, client.pairs))
+            candidate, diagnostic = best_size_detailed(
+                signal.edges, books, client.pairs, minimum, cap, settings.min_net_bps,
+            )
+            stats["confirmed_candidates"] += 1
+        except Exception as exc:
+            logger.warning("depth check failed for %s: %s", "->".join(signal.route), exc)
+            stats["book_rejections"] += 1
+            stats["rejection_codes"]["DEPTH_REQUEST_FAILED"] = (
+                stats["rejection_codes"].get("DEPTH_REQUEST_FAILED", 0) + 1)
+            continue
+        if candidate is None:
+            code = diagnostic["code"]
+            stats["book_rejections"] += 1
+            stats["rejection_codes"][code] = stats["rejection_codes"].get(code, 0) + 1
+            logger.info("opportunity decision route=%s decision=SKIPPED code=%s "
+                        "sizes=%s pair_rules=%s insufficient_depth=%s "
+                        "book_unprofitable=%s best_book_net_bps=%s minimum=%s",
+                        "->".join(signal.route), code, diagnostic["sizes"],
+                        diagnostic["PAIR_RULES"], diagnostic["INSUFFICIENT_DEPTH"],
+                        diagnostic["BOOK_UNPROFITABLE"], diagnostic["best_net_bps"], minimum)
+            continue
+        disagreement = abs(signal.net_bps - candidate.net_bps)
+        if disagreement > settings.max_slippage_bps:
+            stats["book_rejections"] += 1
+            stats["rejection_codes"]["FEED_DISAGREEMENT"] = (
+                stats["rejection_codes"].get("FEED_DISAGREEMENT", 0) + 1)
+            logger.info("opportunity decision route=%s decision=SKIPPED "
+                        "code=FEED_DISAGREEMENT signal_net_bps=%.4f book_net_bps=%.4f",
+                        "->".join(signal.route), signal.net_bps, candidate.net_bps)
+            continue
+        stats["book_candidates"] += 1
+        logger.info("opportunity decision route=%s decision=ELIGIBLE size=%s "
                         "signal_net_bps=%.4f book_net_bps=%.4f expected_profit=%s",
                         "->".join(signal.route), candidate.start_amount, signal.net_bps,
                         candidate.net_bps, candidate.profit)
-            if candidate:
-                if candidate.route[0] == "USDT":
-                    score = (1, candidate.profit)
+        if candidate:
+            if candidate.route[0] == "USDT":
+                score = (1, candidate.profit)
+            else:
+                valuation = client.edge(candidate.route[0], "USDT", tickers)
+                if valuation is None:
+                    score = (0, candidate.net_bps)
                 else:
-                    valuation = client.edge(candidate.route[0], "USDT", tickers)
-                    if valuation is None:
-                        score = (0, candidate.net_bps)
-                    else:
-                        score = (1, candidate.profit / valuation.price if valuation.side == "buy"
-                                 else candidate.profit * valuation.price)
-                if best_score is None or score > best_score: best, best_score = candidate, score
+                    score = (1, candidate.profit / valuation.price if valuation.side == "buy"
+                             else candidate.profit * valuation.price)
+            if best_score is None or score > best_score: best, best_score = candidate, score
     return best, stats
 
 
@@ -284,6 +330,12 @@ def run_once(client, settings, tickers, balances, *, permit_live, runtime=None):
     candidate, stats = find_best(client, settings, tickers, balances,
                                  blocked_symbols=blocked_symbols)
     if runtime is not None:
+        runtime["total_ticker_candidates"] = int(runtime.get("total_ticker_candidates", 0)) + stats["ticker_candidates"]
+        runtime["total_confirmed_candidates"] = int(runtime.get("total_confirmed_candidates", 0)) + stats["confirmed_candidates"]
+        runtime["total_book_candidates"] = int(runtime.get("total_book_candidates", 0)) + stats["book_candidates"]
+        if stats["ticker_candidates"]:
+            runtime["last_candidate_at"] = time.time()
+            runtime["last_candidate_bps"] = str(stats["best_signal_bps"])
         runtime.update(stats)
         runtime["last_scan_at"] = time.time()
         runtime["scan_count"] = int(runtime.get("scan_count", 0)) + 1
@@ -356,11 +408,27 @@ def status_text(settings, runtime):
         f"State: {state_icon} {desired.upper()}",
         total_text, f"💰 Starts: {','.join(settings.start_currencies)}",
         f"📈 Tickers: {runtime.get('tickers', 'n/a')}",
+        f"📡 Feed: {runtime.get('connected_groups', 'n/a')}/"
+        f"{runtime.get('total_groups', 'n/a')} streams; "
+        f"last tick age={runtime.get('last_message_age_s', 'n/a')}s",
         f"🔄 Triangles: {runtime.get('triangles', 'n/a')}",
-        f"🎯 Candidates: {runtime.get('ticker_candidates', 'n/a')}",
+        f"🎯 Candidates: {runtime.get('ticker_candidates', 'n/a')} this scan / "
+        f"{runtime.get('total_ticker_candidates', 0)} total",
+        f"🔬 Confirmed: {runtime.get('confirmed_candidates', 'n/a')} this scan / "
+        f"{runtime.get('total_confirmed_candidates', 0)} total",
+        f"🚫 Rejections: {runtime.get('rejection_codes', {})}",
         discount_text,
         f"🧾 Last decision: {runtime.get('last_decision', 'none')}",
         f"⚠️ Last error: {runtime.get('last_error', 'none')}"))
+
+
+def _handle_rate_limit(exc, runtime):
+    wait_s = min(max(float(exc.retry_after_s or 60), 1), 600)
+    runtime.update(last_decision="RATE_LIMIT_BACKOFF",
+                   last_error=f"RateLimitError: {exc}", rate_limit_wait_s=wait_s)
+    logger.error("Binance rate limit endpoint=%s retry_after_s=%s",
+                 exc.endpoint, wait_s)
+    time.sleep(wait_s)
 
 
 def stream_probe(client, *, timeout_s=15):
@@ -505,39 +573,59 @@ def main(argv=None):
                 last_control_state = control["desired_state"]
             if control["clear_issued_at"]:
                 runtime["last_clear"] = _store(settings).clear_active(); cp.consume_clear(); control = cp.read_control()
+            health_tickers = stream.snapshot(max_age_s=settings.ticker_max_age_s)
+            runtime.update(stream.health(), tickers=len(health_tickers))
             if now - last_heartbeat >= 2:
                 cp.write_heartbeat(control["desired_state"], status_text(settings, runtime), runtime,
                                    started_at=started); last_heartbeat = now
             if control["desired_state"] == cp.PAUSED:
                 time.sleep(min(settings.scan_interval_s, 1)); continue
             if now - last_seed >= settings.rest_seed_interval_s:
-                stream.seed(client.tickers()); last_seed = now
+                seed_started = time.monotonic()
+                try:
+                    stream.seed(client.tickers(), observed_at=seed_started)
+                except RateLimitError as exc:
+                    _handle_rate_limit(exc, runtime); continue
+                last_seed = now
             refresh_balances = now - balance_at >= 5
             if refresh_balances:
-                balances, balance_at = client.balances(), now
-                update_portfolio_runtime(runtime, client,
-                                         stream.snapshot(max_age_s=settings.ticker_max_age_s),
-                                         client.total_balances())
+                try:
+                    balances, balance_at = client.balances(), now
+                    update_portfolio_runtime(runtime, client,
+                                             stream.snapshot(max_age_s=settings.ticker_max_age_s),
+                                             client.total_balances())
+                except RateLimitError as exc:
+                    _handle_rate_limit(exc, runtime); continue
             fresh_tickers = stream.snapshot(max_age_s=settings.ticker_max_age_s)
             if refresh_balances:
                 bnb_discount_active = maintain_bnb_fee_reserve(client, settings, fresh_tickers, balances)
                 runtime["bnb_fee_discount_active"] = bnb_discount_active
                 if not bnb_discount_active and settings.bnb_replenish_enabled and not settings.dry_run:
                     balance_at = 0
-            result = run_once(client, settings, fresh_tickers, balances,
-                              permit_live=True, runtime=runtime)
+            try:
+                result = run_once(client, settings, fresh_tickers, balances,
+                                  permit_live=True, runtime=runtime)
+            except RateLimitError as exc:
+                _handle_rate_limit(exc, runtime); continue
             if result and not settings.dry_run: balance_at = 0
             if now - last_scan_log >= settings.scan_log_interval_s:
                 funded = ",".join(f"{asset}:{balances.get(asset, 0)}"
                                   for asset in settings.start_currencies
                                   if balances.get(asset, 0) > 0)
                 logger.info("scan heartbeat mode=%s scans=%d fresh_tickers=%d triangles=%d "
-                            "ticker_candidates=%d book_candidates=%d book_rejections=%d "
-                            "best_signal_bps=%s best_start=%s decision=%s balances=%s",
+                            "ticker_candidates=%d confirmed_candidates=%d book_candidates=%d "
+                            "book_rejections=%d rejection_codes=%s total_ticker_candidates=%d "
+                            "stream_groups=%s/%s last_tick_age_s=%s best_signal_bps=%s "
+                            "best_start=%s decision=%s balances=%s",
                             "DRY_RUN" if settings.dry_run else "LIVE", runtime["scan_count"],
                             len(fresh_tickers), runtime.get("triangles", 0),
-                            runtime.get("ticker_candidates", 0), runtime.get("book_candidates", 0),
-                            runtime.get("book_rejections", 0), runtime.get("best_signal_bps"),
+                            runtime.get("ticker_candidates", 0),
+                            runtime.get("confirmed_candidates", 0),
+                            runtime.get("book_candidates", 0), runtime.get("book_rejections", 0),
+                            runtime.get("rejection_codes", {}),
+                            runtime.get("total_ticker_candidates", 0),
+                            runtime.get("connected_groups"), runtime.get("total_groups"),
+                            runtime.get("last_message_age_s"), runtime.get("best_signal_bps"),
                             runtime.get("best_signal_route"), runtime.get("last_decision"), funded)
                 last_scan_log = now
             time.sleep(settings.scan_interval_s)

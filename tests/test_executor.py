@@ -54,7 +54,7 @@ def test_three_filled_legs_complete_and_archive(tmp_path):
                       settlement_interval_s=0).execute(opportunity)
     assert result["status"] == "COMPLETE"
     assert result["resized_from"] == Decimal("10")
-    assert result["start_amount"] == Decimal("50")
+    assert result["start_amount"] == Decimal("100")
     assert len(client.orders) == 3
     assert not store.active()
     assert len(list(store.archive.glob("*.json"))) == 1

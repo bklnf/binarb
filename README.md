@@ -13,9 +13,12 @@ IDs, and exact fill-commission accounting.
 
 - The checked-in default is dry-run. Live `run` additionally requires
   `BINANCE_LIVE_ACK=I_ACCEPT_LIVE_TRADING`; `scan-once` can never trade.
-- An all-market WebSocket cache retains one bid/ask tuple per symbol in memory.
+- An all-market WebSocket cache retains one bid/ask tuple per symbol in memory,
+  rejects out-of-order updates, reports connection health, and defaults to a
+  two-second freshness window.
   Raw ticks are never written. REST depth is requested only for profitable
-  ticker candidates, and all three books are walked before authorization.
+  ticker candidates. A route's three books are requested concurrently and
+  reused for rotated candidates within the scan before all levels are walked.
 - Binance's account taker tier is used conservatively for screening. Each live
   route is revalidated using non-executing `order/test` fee computation and
   fresh depth immediately before leg 1.
@@ -25,9 +28,9 @@ IDs, and exact fill-commission accounting.
   is resolved using its deterministic `newClientOrderId`; it is never blindly
   retried. Confirmed intermediate inventory is flattened to the start asset on
   ordinary failures. Ambiguous exposure stops for operator recovery.
-- Opportunity sizing matches lazy arb: the cap is the full free start balance,
-  while the conservative probe grid starts at half of that cap and halves down
-  to the configured floor. Immediately before leg 1, fresh balances and all
+- Opportunity sizing can use the full configured free-balance cap, derives a
+  minimum executable start amount from all three pairs, and
+  samples a dense geometric grid down to that exact floor. Immediately before leg 1, fresh balances and all
   three books rerun the complete grid and may resize the opportunity.
 - Completed state records are capped at 2,000 files and 30 days by default.
   Docker logs rotate at 30 MB for the strategy and 10 MB for Telegram.
@@ -97,6 +100,7 @@ docker compose --profile operator up -d tg-gateway
 
 Copy `.env.example` settings into the secret `.env`. Defaults monitor funded
 stablecoin, crypto-hub, and fiat start assets. The configured cap is 100% of
-each free start balance; the lazy-arb grid itself never starts above 50%.
+each free start balance; the sizing grid includes that full configured cap.
 Venue minimums and precision filters remain authoritative, so there is no
-invalid cross-asset "10 units" assumption.
+  invalid cross-asset "10 units" assumption. Restricted bridge assets can be
+  removed with `ARB_EXCLUDED_ASSETS_BINANCE` (IDR by default for this account).

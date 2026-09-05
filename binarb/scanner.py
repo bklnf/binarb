@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 
 from .models import Book, Edge, Opportunity, PairMeta
@@ -10,10 +11,12 @@ BPS = Decimal(10000)
 
 def build_edges(pairs: dict[str, PairMeta], fees: dict[str, Decimal],
                 tickers: dict[str, tuple[Decimal, Decimal]], *,
-                blocked_symbols=frozenset()) -> dict[tuple[str, str], Edge]:
+                blocked_symbols=frozenset(), excluded_assets=frozenset()
+                ) -> dict[tuple[str, str], Edge]:
     edges = {}
     for symbol, meta in pairs.items():
-        if symbol in blocked_symbols:
+        if (symbol in blocked_symbols or meta.base in excluded_assets
+                or meta.quote in excluded_assets):
             continue
         prices, fee = tickers.get(symbol), fees.get(symbol)
         if prices is None or fee is None:
@@ -75,10 +78,18 @@ def _down(amount: Decimal, step: Decimal) -> Decimal:
     return (amount / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
-def simulate(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
-             pairs: dict[str, PairMeta], start_amount: Decimal) -> Opportunity | None:
+@dataclass(frozen=True)
+class SimulationResult:
+    opportunity: Opportunity | None
+    code: str
+    leg: int | None = None
+    detail: str | None = None
+
+
+def simulate_detailed(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
+                      pairs: dict[str, PairMeta], start_amount: Decimal) -> SimulationResult:
     amount, route = Decimal(start_amount), [edges[0].source]
-    for edge in edges:
+    for leg, edge in enumerate(edges, 1):
         meta, book = pairs[edge.symbol], books[edge.symbol]
         if edge.side == "buy":
             budget, remaining, gross = amount, amount, Decimal(0)
@@ -92,11 +103,12 @@ def simulate(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
             # output must still be conservative at base LOT_SIZE precision.
             gross = _down(gross, meta.base_step)
             consumed = budget - max(remaining, Decimal(0))
-            if (remaining > Decimal("0.000000000001") or gross < meta.min_qty
-                    or (meta.max_qty and gross > meta.max_qty)
+            if remaining > Decimal("0.000000000001"):
+                return SimulationResult(None, "INSUFFICIENT_DEPTH", leg, edge.symbol)
+            if (gross < meta.min_qty or (meta.max_qty and gross > meta.max_qty)
                     or consumed < meta.min_notional
                     or (meta.max_notional is not None and consumed > meta.max_notional)):
-                return None
+                return SimulationResult(None, "PAIR_RULES", leg, edge.symbol)
         else:
             # The protected FOK/IOC attempts use LOT_SIZE. Market-only rules
             # are checked again if execution reaches the final fallback.
@@ -108,40 +120,109 @@ def simulate(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
                 remaining -= take
                 if remaining <= Decimal("0.000000000001"):
                     break
-            if (remaining > Decimal("0.000000000001") or sell < meta.min_qty
-                    or (meta.max_qty and sell > meta.max_qty)):
-                return None
+            if remaining > Decimal("0.000000000001"):
+                return SimulationResult(None, "INSUFFICIENT_DEPTH", leg, edge.symbol)
+            if sell < meta.min_qty or (meta.max_qty and sell > meta.max_qty):
+                return SimulationResult(None, "PAIR_RULES", leg, edge.symbol)
             gross = gross.quantize(Decimal(1).scaleb(-min(meta.quote_precision, 8)),
                                    rounding=ROUND_DOWN)
-            if gross < meta.min_notional or (meta.max_notional is not None and gross > meta.max_notional):
-                return None
+            if (gross < meta.min_notional
+                    or (meta.max_notional is not None and gross > meta.max_notional)):
+                return SimulationResult(None, "PAIR_RULES", leg, edge.symbol)
         amount = gross * (Decimal(1) - edge.fee)
         route.append(edge.target)
     bps = (amount / start_amount - Decimal(1)) * BPS
-    return Opportunity(tuple(route), edges, start_amount, amount, bps, amount - start_amount)
+    return SimulationResult(
+        Opportunity(tuple(route), edges, start_amount, amount, bps, amount - start_amount),
+        "OK",
+    )
+
+
+def simulate(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
+             pairs: dict[str, PairMeta], start_amount: Decimal) -> Opportunity | None:
+    return simulate_detailed(edges, books, pairs, start_amount).opportunity
 
 
 def conservative_size_grid(available: Decimal, minimum: Decimal):
-    """Lazy-arb sizing: half available first, then halve to the exact floor."""
+    """Sample a dense grid from the configured balance cap to the route floor.
+
+    A four-point halving grid routinely jumped across a narrow executable range.
+    The denser geometric grid includes the full configured cap and exact floor
+    while allowing quantity/notional filters to find a valid size.
+    """
     available, minimum = Decimal(available), Decimal(minimum)
     if minimum <= 0 or available < minimum:
         return []
-    result = []
-    current = available / Decimal(2)
-    while current >= minimum:
-        result.append(current)
-        current /= Decimal(2)
+    maximum = available
+    result = [maximum]
+    ratio = (minimum / maximum) ** (Decimal(1) / Decimal(15))
+    current = maximum
+    for _ in range(14):
+        current *= ratio
+        if current > minimum:
+            result.append(current)
     if not result or result[-1] != minimum:
         result.append(minimum)
     return list(dict.fromkeys(result))
 
 
+def route_minimum_start(edges: tuple[Edge, Edge, Edge],
+                        pairs: dict[str, PairMeta]) -> Decimal:
+    """Estimate the smallest start amount that can satisfy every leg's filters."""
+    factor = Decimal(1)
+    required = Decimal(0)
+    for edge in edges:
+        meta = pairs[edge.symbol]
+        if edge.side == "buy":
+            local = max(meta.min_notional, meta.min_qty * edge.price)
+            conversion = (Decimal(1) / edge.price) * (Decimal(1) - edge.fee)
+        else:
+            local = max(meta.min_qty, (meta.min_notional / edge.price
+                                      if edge.price else Decimal("Infinity")))
+            conversion = edge.price * (Decimal(1) - edge.fee)
+        if factor > 0:
+            required = max(required, local / factor)
+        factor *= conversion
+    # Quantization and quote rounding can otherwise leave the exact boundary
+    # just below a filter. One percent is negligible relative to the live
+    # profitability threshold and is revalidated against the actual books.
+    return required * Decimal("1.01")
+
+
 def best_size(edges, books, pairs, minimum, maximum, min_net_bps):
+    best, _diagnostic = best_size_detailed(
+        edges, books, pairs, minimum, maximum, min_net_bps,
+    )
+    return best
+
+
+def best_size_detailed(edges, books, pairs, minimum, maximum, min_net_bps):
     best = None
+    diagnostics = {"sizes": 0, "PAIR_RULES": 0, "INSUFFICIENT_DEPTH": 0,
+                   "BOOK_UNPROFITABLE": 0, "best_net_bps": None}
     for amount in conservative_size_grid(maximum, minimum):
-        candidate = simulate(edges, books, pairs, amount)
-        if candidate is None or candidate.net_bps < min_net_bps:
+        diagnostics["sizes"] += 1
+        result = simulate_detailed(edges, books, pairs, amount)
+        candidate = result.opportunity
+        if candidate is None:
+            diagnostics[result.code] += 1
+            continue
+        if (diagnostics["best_net_bps"] is None
+                or candidate.net_bps > diagnostics["best_net_bps"]):
+            diagnostics["best_net_bps"] = candidate.net_bps
+        if candidate.net_bps < min_net_bps:
+            diagnostics["BOOK_UNPROFITABLE"] += 1
             continue
         if best is None or candidate.profit > best.profit:
             best = candidate
-    return best
+    if best is not None:
+        diagnostics["code"] = "ELIGIBLE"
+    elif diagnostics["BOOK_UNPROFITABLE"]:
+        diagnostics["code"] = "BOOK_UNPROFITABLE"
+    elif diagnostics["INSUFFICIENT_DEPTH"]:
+        diagnostics["code"] = "INSUFFICIENT_DEPTH"
+    elif diagnostics["PAIR_RULES"]:
+        diagnostics["code"] = "PAIR_RULES"
+    else:
+        diagnostics["code"] = "NO_SIZE_GRID"
+    return best, diagnostics

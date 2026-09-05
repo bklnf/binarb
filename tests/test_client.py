@@ -8,7 +8,8 @@ from binarb.models import Edge, PairMeta
 
 
 class Response:
-    def __init__(self, payload, status=200): self.payload, self.status_code = payload, status
+    def __init__(self, payload, status=200, headers=None):
+        self.payload, self.status_code, self.headers = payload, status, headers or {}
     @property
     def ok(self): return self.status_code < 400
     def json(self): return self.payload
@@ -43,6 +44,16 @@ def test_prepare_order_obeys_market_steps_and_quote_budget():
     sell = Edge("A", "USDT", "AUSDT", "sell", Decimal("9"), Decimal(".001"))
     assert client.prepare_market_order(buy, Decimal("5.123456789")) == {"quoteOrderQty": "5.12345678"}
     assert client.prepare_market_order(sell, Decimal("1.239")) == {"quantity": "1.23"}
+
+
+def test_market_order_honors_filter_applicability_and_quote_order_capability():
+    client = BinanceClient("key", "secret", session=Session([]))
+    client.pairs = {"AUSDT": replace(
+        pair(), min_notional_apply_market=False,
+        quote_order_qty_market_allowed=False,
+    )}
+    buy = Edge("USDT", "A", "AUSDT", "buy", Decimal("10"), Decimal(".001"))
+    assert client.prepare_market_order(buy, Decimal("1.239")) == {"quantity": "0.12"}
 
 
 def test_prepare_limit_order_rounds_price_protectively_and_quantity_down():
