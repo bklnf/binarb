@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import hmac
 import threading
@@ -12,6 +13,7 @@ import requests
 from .errors import AuthenticationError, BinanceError, RateLimitError
 from .models import Book, Edge, Fill, Level, PairMeta
 from .market_stream import TickerSnapshot
+from .commissions import CommissionUnavailable, parse_rates, trade_budget
 
 
 API_ROOT = "https://api.binance.com"
@@ -46,6 +48,8 @@ class BinanceClient:
         self.base_fees: dict[str, Decimal] = {}
         self.bnb_fee_multiplier: Decimal | None = None
         self.bnb_discount_active = False
+        self._commission_cache = {}
+        self._commission_requests = deque()
 
     def _raise(self, response, endpoint: str, *, placement: bool = False):
         if response.ok:
@@ -264,7 +268,7 @@ class BinanceClient:
         return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
     def prepare_market_order(self, edge: Edge, input_amount: Decimal) -> dict:
-        meta, amount = self.pairs[edge.symbol], Decimal(input_amount)
+        meta, amount = self.pairs[edge.symbol], trade_budget(edge, Decimal(input_amount), edge.price)
         if edge.side == "buy":
             quote_step = Decimal(1).scaleb(-min(meta.quote_precision, 8))
             quote = self._down(amount, quote_step)
@@ -313,6 +317,7 @@ class BinanceClient:
             raise ValueError(f"{edge.symbol} price {limit_price} below minimum {meta.min_price}")
         if meta.max_price and limit_price > meta.max_price:
             raise ValueError(f"{edge.symbol} price {limit_price} above maximum {meta.max_price}")
+        amount = trade_budget(edge, amount, limit_price)
         raw_qty = amount / limit_price if edge.side == "buy" else amount
         quantity = self._down(raw_qty, meta.base_step)
         if quantity < meta.min_qty:
@@ -354,25 +359,32 @@ class BinanceClient:
                   "newClientOrderId": "binarb-fee-probe", "computeCommissionRates": "true",
                   **self.prepare_market_order(edge, input_amount)}
         row = self.signed("POST", "/api/v3/order/test", params)
-        standard = _d((row.get("standardCommissionForOrder") or {}).get("taker"))
-        discount = row.get("discount") or {}
-        use_bnb_discount = (self.bnb_discount_active if use_bnb_discount is None
-                            else use_bnb_discount)
-        if (use_bnb_discount and discount.get("enabledForAccount")
-                and discount.get("enabledForSymbol") and discount.get("discountAsset") == "BNB"):
-            # Binance calls this a discount but returns the *remaining-rate*
-            # multiplier: 0.75 means the normal rate is reduced by 25%, not
-            # that only 25% of it remains.
-            remaining_rate = _d(discount.get("discount"))
-            if not Decimal(0) <= remaining_rate <= Decimal(1):
-                raise BinanceError(f"invalid BNB commission multiplier {remaining_rate}", endpoint="order/test")
-            standard *= remaining_rate
-        total = standard
-        for name in ("specialCommissionForOrder", "taxCommissionForOrder"):
-            total += _d((row.get(name) or {}).get("taker"))
-        if not total.is_finite() or not Decimal(0) <= total <= Decimal("0.05"):
-            raise BinanceError(f"invalid computed commission {total}", endpoint="order/test")
-        return total
+        profile = parse_rates(row, edge.side, for_order=True)
+        return profile.effective(self.bnb_discount_active if use_bnb_discount is None else use_bnb_discount)
+
+    def commission_rates(self, edge, input_amount=None):
+        """Cached per-symbol account rates; order-specific rates before entry."""
+        if input_amount is not None:
+            params = {"symbol": edge.symbol, "side": edge.side.upper(), "type": "MARKET",
+                      "computeCommissionRates": "true",
+                      **self.prepare_market_order(edge, input_amount)}
+            return parse_rates(self.signed("POST", "/api/v3/order/test", params),
+                               edge.side, for_order=True)
+        now = time.monotonic()
+        cached = self._commission_cache.get(edge.symbol)
+        if cached and now - cached[0] < 60:
+            return cached[1][edge.side]
+        while self._commission_requests and now - self._commission_requests[0] >= 60:
+            self._commission_requests.popleft()
+        if len(self._commission_requests) >= 30:
+            raise CommissionUnavailable("COMMISSION_REFRESH_BUDGET")
+        if edge.symbol not in self.pairs:
+            raise CommissionUnavailable("COMMISSION_UNKNOWN_SYMBOL")
+        self._commission_requests.append(now)
+        row = self.signed("GET", "/api/v3/account/commission", {"symbol": edge.symbol})
+        profiles = {side: parse_rates(row, side) for side in ("buy", "sell")}
+        self._commission_cache[edge.symbol] = (now, profiles)
+        return profiles[edge.side]
 
     def get_order(self, symbol: str, *, order_id: str | None = None,
                   client_order_id: str | None = None) -> Fill:

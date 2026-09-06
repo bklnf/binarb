@@ -7,12 +7,13 @@ import math
 import os
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 
 from . import control_plane as cp
 from .client import BinanceClient
+from .commissions import CommissionUnavailable, plan_edges, reference_symbols, price_change_bps
 from .executor import Executor, client_id
 from .errors import RateLimitError
 from .market_stream import BookTickerStream
@@ -247,8 +248,10 @@ def update_portfolio_runtime(runtime, client, tickers, balances):
     runtime["unpriced_asset_count"] = len(unpriced)
 
 
-def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset()):
+def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(),
+              research_quote_limits=None):
     began = time.monotonic()
+    screen_age, screen_skew = research_quote_limits or (settings.ticker_max_age_s, settings.quote_max_skew_s)
     edges = build_edges(client.pairs, client.fees, tickers,
                         blocked_symbols=blocked_symbols,
                         excluded_assets=settings.excluded_assets)
@@ -257,7 +260,7 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
              "book_rejections": 0, "triangles": 0, "best_signal_bps": None,
              "best_signal_route": None, "confirmed_candidates": 0,
              "rejection_codes": {}, "quote_rejections": {}, "shortlisted_candidates": 0,
-             "depth_requests": 0, "best_book_net_bps": None,
+             "depth_requests": 0, "best_book_net_bps": None, "signal_basis": "GROSS_PRICE",
              "balances": {a: str(balances.get(a, 0)) for a in settings.start_currencies}}
 
     def reject(code):
@@ -272,8 +275,8 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
         stats["triangles"] += len(routes)
         signals, raw_best_bps = screen_top_of_book(
             edges, routes, cap, settings.min_net_bps,
-            max_age_s=settings.ticker_max_age_s, max_skew_s=settings.quote_max_skew_s,
-            diagnostics=stats["quote_rejections"],
+            max_age_s=screen_age, max_skew_s=screen_skew,
+            diagnostics=stats["quote_rejections"], gross_screen=True,
         )
         if raw_best_bps is not None and (stats["best_signal_bps"] is None
                                          or raw_best_bps > stats["best_signal_bps"]):
@@ -282,7 +285,7 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
         funded = []
         for signal in signals:
             minimum = max(cap * settings.min_size_share,
-                          route_minimum_start(signal.edges, client.pairs))
+                          route_minimum_start(tuple(replace(e, fee=Decimal(0)) for e in signal.edges), client.pairs))
             if minimum > cap:
                 reject("NO_SIZE_GRID")
                 continue
@@ -302,22 +305,24 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
     stats["shortlisted_candidates"] = len(pending)
     book_cache = {}
     # One bounded pool per scan; only start threads if a funded signal exists.
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         for signal, cap, minimum in pending:
-            code = observation_error(signal.edges, max_age_s=settings.ticker_max_age_s,
-                                     max_skew_s=settings.quote_max_skew_s)
+            code = observation_error(signal.edges, max_age_s=screen_age, max_skew_s=screen_skew)
             if code:
                 reject(code)
                 continue
             decision_started = time.monotonic()
             observed = [edge.observed_at for edge in signal.edges]
-            logger.info("ticker candidate route=%s signal_net_bps=%.4f "
+            logger.info("ticker candidate route=%s signal_gross_bps=%.4f "
                         "oldest_quote_ms=%.3f quote_skew_ms=%.3f",
                         "->".join(signal.route), signal.net_bps,
                         (decision_started - min(observed)) * 1000,
                         (max(observed) - min(observed)) * 1000)
-            symbols = {edge.symbol for edge in signal.edges}
             try:
+                profiles = tuple(client.commission_rates(edge) for edge in signal.edges)
+                symbols = reference_symbols(signal.edges, profiles, client.pairs,
+                    balances=balances,
+                    blocked_symbols=blocked_symbols, excluded_assets=settings.excluded_assets)
                 cached = [book_cache[symbol] for symbol in symbols if symbol in book_cache]
                 # Refetch the entire route when reused books would be stale or
                 # too far apart from newly requested observations.
@@ -337,12 +342,24 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
                     reject("DEPTH_" + code)
                     stats["book_rejections"] += 1
                     continue
+                planned = plan_edges(signal.edges, profiles, books, client.pairs, balances)
+                minimum = max(cap * settings.min_size_share,
+                              route_minimum_start(planned, client.pairs))
                 candidate, diagnostic = best_size_detailed(
-                    signal.edges, books, client.pairs, minimum, cap, settings.min_net_bps,
+                    planned, books, client.pairs, minimum, cap, settings.min_net_bps,
                 )
+                from .research import capture
+                capture(settings.state_dir, planned, books, client.pairs, minimum, cap,
+                        settings.min_net_bps, ticker_gate=observation_error(signal.edges,
+                            max_age_s=settings.ticker_max_age_s, max_skew_s=settings.quote_max_skew_s),
+                        price_change=price_change_bps(signal.edges, books),
+                        research=research_quote_limits is not None)
                 stats["confirmed_candidates"] += 1
             except RateLimitError:
                 raise
+            except CommissionUnavailable as exc:
+                reject(str(exc))
+                continue
             except Exception as exc:
                 logger.warning("depth check failed route=%s error_type=%s",
                                "->".join(signal.route), type(exc).__name__)
@@ -355,7 +372,7 @@ def find_best(client, settings, tickers, balances, *, blocked_symbols=frozenset(
                 stats["best_book_net_bps"] = book_bps
             code = diagnostic["code"]
             if candidate is not None:
-                if abs(signal.net_bps - candidate.net_bps) > settings.max_slippage_bps:
+                if price_change_bps(signal.edges, books) > settings.max_slippage_bps:
                     code, candidate = "FEED_DISAGREEMENT", None
             elapsed_ms = (time.monotonic() - decision_started) * 1000
             logger.info("opportunity decision route=%s code=%s sizes=%s "

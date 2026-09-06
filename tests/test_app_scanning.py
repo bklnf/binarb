@@ -1,5 +1,6 @@
 from dataclasses import replace
 from decimal import Decimal
+from binarb.commissions import CommissionRates
 import time
 
 import pytest
@@ -20,6 +21,10 @@ class Client:
         self.fees = {symbol: Decimal(0) for symbol in self.pairs}
         self.prices = {"AUSDT": Decimal(1), "AB": Decimal(1), "BUSDT": Decimal("1.01")}
         self.calls = []
+        self.bnb_discount_active = False
+
+    def commission_rates(self, edge, input_amount=None):
+        return CommissionRates(self.fees[edge.symbol])
 
     def tickers(self, age=0):
         return TickerSnapshot({s: (p, p) for s, p in self.prices.items()},
@@ -90,3 +95,26 @@ def test_cumulative_rejections_survive_a_scan_without_candidates(tmp_path):
     run_once(client, config, client.tickers(), {}, permit_live=False, runtime=runtime)
     assert runtime["rejection_codes"] == {}
     assert runtime["total_rejection_codes"] == {"NO_SIZE_GRID": 1}
+
+
+def test_fee_or_rounding_loss_does_not_trigger_price_disagreement():
+    client = Client()
+    client.fees = {s: Decimal('.001') for s in client.pairs}
+    client.pairs = {s: replace(p, base_step=Decimal('.000001')) for s, p in client.pairs.items()}
+    candidate, stats = find_best(client, settings(), client.tickers(), {'USDT': Decimal(100)})
+    assert candidate is not None
+    assert 'FEED_DISAGREEMENT' not in stats['rejection_codes']
+
+
+def test_research_can_check_old_tickers_but_cannot_accept_old_depth():
+    client = Client()
+    snapshot = client.tickers(age=10)
+    candidate, _ = find_best(client, settings(), snapshot, {'USDT': Decimal(10)},
+                             research_quote_limits=(30, 30))
+    assert candidate is not None
+    original = client.order_book
+    client.order_book = lambda s: replace(original(s), observed_at=time.monotonic() - 10)
+    candidate, stats = find_best(client, settings(), snapshot, {'USDT': Decimal(10)},
+                                 research_quote_limits=(30, 30))
+    assert candidate is None
+    assert stats['rejection_codes'] == {'DEPTH_STALE_QUOTES': 1}

@@ -35,6 +35,12 @@ class Edge:
     price: Decimal
     fee: Decimal
     observed_at: float | None = None
+    # None retains the historical received-asset model. Explicit plans carry
+    # units of commission asset per received unit and its value in start units.
+    fee_asset: str | None = None
+    fee_conversion: Decimal = Decimal(1)
+    fee_value: Decimal = Decimal(0)
+    fee_available: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,8 @@ class Opportunity:
     # reported separately and receives no speculative liquidation credit.
     unspent_start: Decimal = Decimal(0)
     residuals: tuple[tuple[str, Decimal], ...] = ()
+    external_fees: tuple[tuple[str, Decimal], ...] = ()
+    external_fee_value: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)

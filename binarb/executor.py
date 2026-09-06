@@ -11,6 +11,7 @@ import requests
 
 from .errors import AmbiguousOrderError, BinanceError, RecoveryRequired
 from .scanner import best_size, observation_error, route_minimum_start
+from .commissions import plan_edges, reference_symbols, price_change_bps, commission_amount, trade_budget
 
 
 logger = logging.getLogger(__name__)
@@ -56,33 +57,28 @@ class Executor:
         amount = opportunity.start_amount
         try:
             fresh_balances = self.client.balances()
-            # Eligibility is not proof of an available commission reserve.
-            # BNB routes may consume that reserve, so reprice them at full fees.
-            if hasattr(self.client, "bnb_discount_active"):
-                self.client.bnb_discount_active = (
-                    self.client.bnb_discount_active
-                    and fresh_balances.get("BNB", Decimal(0)) > 0
-                    and "BNB" not in opportunity.route)
-            # Exact side-specific fee probes are non-executing and also verify
-            # commission configuration immediately before exposure is created.
-            # A successful order/test is not proof that a live order is
-            # permitted for a regionally restricted symbol.
-            exact_edges_list, projected = [], amount
+            # Order/test is non-executing; its taker rates already include
+            # the order side. Refresh all profiles before fetching coherent books.
+            profiles, projected = [], amount
             for edge in opportunity.edges:
                 try:
-                    fee = self.client.test_commission(edge, projected)
+                    profile = self.client.commission_rates(edge, projected)
                 except BinanceError as exc:
                     self._block_if_account_restricted(state, edge, exc)
                     raise
-                exact = type(edge)(edge.source, edge.target, edge.symbol, edge.side,
-                                   edge.price, fee)
-                exact_edges_list.append(exact)
-                projected = (projected / edge.price if edge.side == "buy"
-                             else projected * edge.price) * (Decimal(1) - fee)
-            exact_edges = tuple(exact_edges_list)
-            symbols = sorted({edge.symbol for edge in exact_edges})
-            with ThreadPoolExecutor(max_workers=min(3, len(symbols))) as pool:
+                profiles.append(profile)
+                budget = trade_budget(edge, projected, edge.price)
+                projected = budget / edge.price if edge.side == "buy" else budget * edge.price
+                pays_bnb = profile.bnb_eligible and fresh_balances.get("BNB", Decimal(0)) > 0
+                if not pays_bnb or edge.target == "BNB":
+                    projected *= 1 - profile.effective(pays_bnb)
+            symbols = sorted(reference_symbols(opportunity.edges, profiles, self.client.pairs,
+                balances=fresh_balances,
+                blocked_symbols=self.state_store.blocked_symbols()))
+            with ThreadPoolExecutor(max_workers=min(4, len(symbols))) as pool:
                 books = dict(zip(symbols, pool.map(self.client.order_book, symbols)))
+            exact_edges = plan_edges(opportunity.edges, profiles, books, self.client.pairs,
+                                    fresh_balances)
             fresh_available = (fresh_balances.get(opportunity.route[0], Decimal(0))
                                * self.balance_share)
             minimum = max(fresh_available * self.min_size_share,
@@ -93,7 +89,7 @@ class Executor:
                 books.values(), max_age_s=self.max_quote_age_s, max_skew_s=self.max_quote_skew_s)
             if (quote_error or not self.entry_allowed() or repriced is None
                     or repriced.net_bps < self.min_net_bps or
-                    abs(opportunity.net_bps - repriced.net_bps) > self.max_slippage_bps):
+                    price_change_bps(opportunity.edges, books) > self.max_slippage_bps):
                 state.update(status="REPRICE_UNPROFITABLE",
                              rejection_reason=quote_error or ("OPERATOR_PAUSED"
                                  if not self.entry_allowed() else "REPRICE_UNPROFITABLE"),
@@ -111,7 +107,11 @@ class Executor:
                          expected_net_bps=repriced.net_bps, resized_from=original_size,
                          resized_at=time.time(), fresh_available=fresh_available,
                          projected_unspent_start=repriced.unspent_start,
-                         projected_residuals=dict(repriced.residuals))
+                         projected_residuals=dict(repriced.residuals),
+                         projected_external_fees=dict(repriced.external_fees),
+                         projected_external_fee_value=repriced.external_fee_value,
+                         commission_values={e.fee_asset: e.fee_value for e in exact_edges
+                                            if e.fee_asset not in {e.source, e.target}})
             self.state_store.save(deal_id, state)
             logger.info("execution authorized deal_id=%s route=%s fresh_net_bps=%s",
                         deal_id, "->".join(opportunity.route), repriced.net_bps)
@@ -210,6 +210,12 @@ class Executor:
                             "remaining=%s reason=%s", deal_id, leg, policy, edge.symbol,
                             remaining, exc)
                 continue
+            if edge.fee_asset and edge.fee_asset not in {edge.source, edge.target}:
+                expected_price = price or edge.price
+                gross = remaining / expected_price if edge.side == "buy" else remaining * expected_price
+                available = self.client.balances().get(edge.fee_asset, Decimal(0))
+                if commission_amount(edge, gross) > available:
+                    raise RecoveryRequired(f"leg {leg} commission reserve depleted")
             if entry_books is not None and spent_total == 0:
                 code = observation_error(entry_books.values(), max_age_s=self.max_quote_age_s,
                                          max_skew_s=self.max_quote_skew_s)
@@ -238,6 +244,9 @@ class Executor:
                 state["actual_start_spent"] = (
                     Decimal(str(state.get("actual_start_spent", 0))) + spent)
             self.state_store.save(deal_id, state)
+            if edge.fee_asset and any(value > 0 and asset != edge.fee_asset
+                                       for asset, value in fill.commissions):
+                raise RecoveryRequired(f"leg {leg} commission asset changed after preflight")
             if spent_total > Decimal(amount):
                 raise RecoveryRequired(f"leg {leg} {policy} spent beyond persisted budget")
             logger.warning("leg attempt deal_id=%s leg=%s policy=%s symbol=%s status=%s "
@@ -269,11 +278,21 @@ class Executor:
                     in state.get("external_commissions", {}).items() if Decimal(str(amount)) > 0}
         if not external:
             return Decimal(0), {}
+        values = state.get("commission_values", {})
+        value, unvalued = Decimal(0), {}
+        remaining = {}
+        for asset, amount in external.items():
+            if asset in values and Decimal(str(values[asset])) > 0:
+                value += amount * Decimal(str(values[asset]))
+            else:
+                remaining[asset] = amount
+        if not remaining:
+            return value, {}
         try:
             tickers = self.client.tickers()
         except Exception:
-            return Decimal(0), external
-        value, unvalued = Decimal(0), {}
+            return value, remaining
+        external = remaining
         for asset, amount in external.items():
             if asset == start:
                 value += amount

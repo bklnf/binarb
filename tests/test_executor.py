@@ -1,4 +1,5 @@
 from decimal import Decimal
+from binarb.commissions import CommissionRates
 from dataclasses import replace
 import json
 import time
@@ -27,7 +28,10 @@ class FakeClient:
                       "BUSD": meta("BUSD", "B", "USD")}
         self.balance = {"USD": Decimal("100"), "A": Decimal(0), "B": Decimal(0)}
         self.orders = []
+        self.bnb_discount_active = False
     def test_commission(self, edge, amount): return Decimal(0)
+    def commission_rates(self, edge, input_amount=None):
+        return CommissionRates(self.test_commission(edge, input_amount))
     def order_book(self, symbol):
         book = {"AUSD": Book((Level(9, 100),), (Level(10, 100),)),
                 "AB": Book((Level(2, 100),), (Level(2.1, 100),)),
@@ -204,3 +208,35 @@ def test_ambiguous_recovery_stays_active(tmp_path):
     state = {"deal_id": "deal", "orders": [], "inventory": {"A": Decimal(1)}}
     assert executor._recover_to_start("deal", state, "USD") is False
     assert state["ambiguous_order"] is True
+
+
+def test_changed_commission_asset_is_persisted_before_recovery(tmp_path):
+    client, store = FakeClient(), StateStore(tmp_path)
+    original = client.new_limit_order
+    client.new_limit_order = lambda *a: replace(original(*a), commissions=(('A', Decimal('.001')),))
+    state = {'deal_id': 'fee-change', 'orders': [], 'inventory': {}}
+    client.balance['BNB'] = Decimal(1)
+    edge = replace(EDGES[0], fee_asset='BNB', fee=Decimal('.001'), fee_conversion=Decimal('.01'))
+    with pytest.raises(RecoveryRequired, match='commission asset changed'):
+        Executor(client, store, dry_run=False)._run_leg('fee-change', 1, edge, Decimal(10), state)
+    saved = json.loads(store.path('fee-change').read_text())
+    assert Decimal(saved['inventory']['A']) == Decimal('.999')
+    assert Decimal(saved['actual_start_spent']) == 10
+    assert Decimal(saved['commissions']['A']) == Decimal('.001')
+
+
+def test_depleted_external_fee_reserve_prevents_order(tmp_path):
+    client, store = FakeClient(), StateStore(tmp_path)
+    state = {'deal_id': 'no-reserve', 'orders': [], 'inventory': {}}
+    edge = replace(EDGES[0], fee_asset='BNB', fee=Decimal('.001'), fee_conversion=Decimal('.01'))
+    with pytest.raises(RecoveryRequired, match='commission reserve depleted'):
+        Executor(client, store, dry_run=False)._run_leg('no-reserve', 1, edge, Decimal(10), state)
+    assert client.orders == []
+
+
+def test_external_fee_values_use_persisted_multihop_basis(tmp_path):
+    executor = Executor(FakeClient(), StateStore(tmp_path))
+    value, unvalued = executor._external_commission_value(
+        {'external_commissions': {'BNB': Decimal('.001')},
+         'commission_values': {'BNB': Decimal(600)}}, 'USD')
+    assert value == Decimal('.6') and not unvalued

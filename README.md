@@ -18,12 +18,15 @@ IDs, and exact fill-commission accounting.
   two-second freshness window per symbol. Activity in another symbol never
   refreshes an old quote. Routes also require observation timestamps within
   `ARB_QUOTE_MAX_SKEW_S_BINANCE` (0.5 seconds by default) of each other.
-  Raw ticks are never written. REST depth is requested only for profitable
-  ticker candidates. A route's three books are requested concurrently and
-  reused for rotated candidates within the scan before all levels are walked.
-- Binance's account taker tier is used conservatively for screening. Each live
+  The ticker shortlist uses gross-price returns as an upper bound, so stale
+  estimated commissions cannot suppress a potentially profitable route. Three
+  route books and, when needed, one BNB valuation book are fetched concurrently.
+  Cached books are reused only while fresh and coherent.
+- Side-specific account commissions are cached for 60 seconds, with at most 30
+  refresh requests per minute. Deferred refreshes reject the candidate. Each live
   route is revalidated using non-executing `order/test` fee computation and
-  fresh depth immediately before leg 1.
+  fresh depth immediately before leg 1. Only standard commission is discounted;
+  tax and special commission remain fully charged.
 - Every leg tries fresh top-of-book `LIMIT/FOK`, then `LIMIT/IOC` for any
   confirmed remainder, then `MARKET` for the still-executable remainder. Each
   attempt is fsynced before placement. A transport/5xx timeout
@@ -36,10 +39,17 @@ IDs, and exact fill-commission accounting.
   three books rerun the complete grid and may resize the opportunity.
   Simulation recomputes the spend for rounded buy quantities and credits cash
   left in the starting asset. Intermediate residuals are reported without
-  assuming they can be liquidated. Fees remain conservatively deducted from
-  simulated received amounts; actual BNB commissions are accounted separately
-  from confirmed fills. Discount eligibility requires an available BNB reserve;
-  live BNB routes are revalidated at full fees because they may consume it.
+  assuming they can be liquidated. Received-asset fees reduce output; source-asset
+  fees reserve part of the order budget. BNB-paid fees preserve acquired tokens
+  and are deducted separately from expected profit at a conservative replacement
+  value from coherent books, including a 10 bps conversion allowance. Routes
+  without a valuation path or sufficient reserve are rejected. BNB-start sizing
+  also reserves BNB outside the trading budget for third-asset fees.
+  Actual fills remain authoritative. A changed commission asset triggers
+  recovery after persisting the confirmed fill. External-fee PnL uses the
+  persisted pre-entry valuation basis; intermediate dust remains unvalued.
+  The local BNB reserve-maintenance switch does not override exchange-reported
+  commission payment eligibility.
 - Unfunded routes are rejected before requesting depth. A bounded worker pool
   and fresh book reuse reduce confirmation overhead. Expired or incoherent
   books cannot authorize entry, and an operator pause is checked again before
@@ -47,6 +57,11 @@ IDs, and exact fill-commission accounting.
   before the next attempt; partial or ambiguous recovery leaves the deal active.
 - Completed state records are capped at 2,000 files and 30 days by default.
   Docker logs rotate at 30 MB for the strategy and 10 MB for Telegram.
+  Candidate books and fee plans are captured under `data/research` at most once
+  per 10 seconds, capped at 200 files, 32 MiB, and seven days. Captures are private
+  (directory 0700, files 0600) and contain sizing inputs but no credentials or
+  account/order responses. Disable with `ARB_CAPTURE_ENABLED_BINANCE=false`.
+  Each capture compares both fee models on identical books and size grids.
 - Healthy operation emits a `scan heartbeat` every 10 seconds by default,
   including scan count, fresh tickers, triangle/candidate counts, best observed
   signal, decision, and funded start balances. Candidate, depth, execution,
@@ -124,3 +139,25 @@ Venue minimums and precision filters remain authoritative, so there is no
   removed with `ARB_EXCLUDED_ASSETS_BINANCE` (IDR by default for this account).
 
 Deployment and rollback steps are in [docs/deployment.md](docs/deployment.md).
+
+Offline replay requires no credentials or network:
+
+```bash
+python -m binarb.research data/research
+```
+
+A bounded observation study can inspect older ticker signals while preserving
+the live depth-age/skew checks. It cannot place or cancel orders, never changes
+control/deal state, and writes separate captures:
+
+```bash
+python -m binarb.research_sample --seconds 60 --output /tmp/binarb-research
+python -m binarb.research /tmp/binarb-research/research
+```
+
+`strict_ticker_gate` records whether the live quote policy excluded a captured
+signal; `price_change_bps` records its disagreement with the reference books.
+Replay eligibility means a simulated size cleared fees and filters; it is not
+proof of an executable or realized profit. Ticker candidate counters now count
+gross-price threshold crossings and are not directly comparable to the prior
+net-fee shortlist. See [commission validation](docs/commission-model.md).
