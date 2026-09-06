@@ -95,3 +95,14 @@ def test_account_restricted_symbols_are_persisted_and_seeded_from_history(tmp_pa
     store.finish("old", state)
     assert store.seed_blocked_symbols_from_archive() == frozenset({"DOGSIDR"})
     assert store.blocked_symbols() == frozenset({"DOGSIDR"})
+
+
+@pytest.mark.parametrize("name,value", [
+    ("ARB_DRY_RUN_BINANCE", "flase"), ("ARB_TICKER_MAX_AGE_S_BINANCE", "nan"),
+    ("ARB_SCAN_INTERVAL_MS_BINANCE", "0"), ("ARB_MIN_NET_BPS_BINANCE", "NaN"),
+    ("ARB_QUOTE_MAX_SKEW_S_BINANCE", "3"), ("ARB_ARCHIVE_MAX_FILES_BINANCE", "0"),
+])
+def test_invalid_safety_configuration_fails_closed(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        Settings.load()

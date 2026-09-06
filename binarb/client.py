@@ -11,6 +11,7 @@ import requests
 
 from .errors import AuthenticationError, BinanceError, RateLimitError
 from .models import Book, Edge, Fill, Level, PairMeta
+from .market_stream import TickerSnapshot
 
 
 API_ROOT = "https://api.binance.com"
@@ -189,7 +190,7 @@ class BinanceClient:
             edge = Edge("USDT", meta.base, symbol, "buy", prices[1], self.base_fees[symbol])
             amount = max(meta.min_notional, Decimal("5"))
             try:
-                effective = self.test_commission(edge, amount)
+                effective = self.test_commission(edge, amount, use_bnb_discount=True)
             except Exception:
                 continue
             base = self.base_fees[symbol]
@@ -207,6 +208,7 @@ class BinanceClient:
         self.fees = {symbol: rate * multiplier for symbol, rate in self.base_fees.items()}
 
     def tickers(self) -> dict[str, tuple[Decimal, Decimal]]:
+        observed_at = time.monotonic()
         rows = self.public("/api/v3/ticker/bookTicker")
         result = {}
         for row in rows:
@@ -214,17 +216,18 @@ class BinanceClient:
             if symbol not in self.pairs:
                 continue
             bid, ask = _d(row.get("bidPrice")), _d(row.get("askPrice"))
-            if bid > 0 and ask >= bid:
+            if bid.is_finite() and ask.is_finite() and bid > 0 and ask >= bid:
                 result[symbol] = (bid, ask)
-        return result
+        return TickerSnapshot(result, observed_at={symbol: observed_at for symbol in result})
 
     def order_book(self, symbol: str, limit: int = 100) -> Book:
+        observed_at = time.monotonic()
         row = self.public("/api/v3/depth", {"symbol": symbol, "limit": limit})
         bids = tuple(Level(_d(p), _d(q)) for p, q in row.get("bids", ()))
         asks = tuple(Level(_d(p), _d(q)) for p, q in row.get("asks", ()))
         if not bids or not asks:
             raise BinanceError(f"one-sided book for {symbol}", endpoint="depth")
-        return Book(bids, asks)
+        return Book(bids, asks, observed_at)
 
     def account(self, *, refresh: bool = False) -> dict:
         if refresh or self._account_cache is None:
@@ -345,14 +348,18 @@ class BinanceClient:
         row = self.signed("POST", endpoint, params, placement=not test)
         return None if test else self._parse_fill(row)
 
-    def test_commission(self, edge: Edge, input_amount: Decimal) -> Decimal:
+    def test_commission(self, edge: Edge, input_amount: Decimal, *,
+                        use_bnb_discount: bool | None = None) -> Decimal:
         params = {"symbol": edge.symbol, "side": edge.side.upper(), "type": "MARKET",
                   "newClientOrderId": "binarb-fee-probe", "computeCommissionRates": "true",
                   **self.prepare_market_order(edge, input_amount)}
         row = self.signed("POST", "/api/v3/order/test", params)
         standard = _d((row.get("standardCommissionForOrder") or {}).get("taker"))
         discount = row.get("discount") or {}
-        if discount.get("enabledForAccount") and discount.get("enabledForSymbol"):
+        use_bnb_discount = (self.bnb_discount_active if use_bnb_discount is None
+                            else use_bnb_discount)
+        if (use_bnb_discount and discount.get("enabledForAccount")
+                and discount.get("enabledForSymbol") and discount.get("discountAsset") == "BNB"):
             # Binance calls this a discount but returns the *remaining-rate*
             # multiplier: 0.75 means the normal rate is reduced by 25%, not
             # that only 25% of it remains.

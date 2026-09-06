@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
+import math
+import time
 
 from .models import Book, Edge, Opportunity, PairMeta
 
@@ -22,10 +24,12 @@ def build_edges(pairs: dict[str, PairMeta], fees: dict[str, Decimal],
         if prices is None or fee is None:
             continue
         bid, ask = prices
-        if bid <= 0 or ask < bid or not Decimal(0) <= fee <= Decimal("0.05"):
+        if (not all(value.is_finite() for value in (bid, ask, fee))
+                or bid <= 0 or ask < bid or not Decimal(0) <= fee <= Decimal("0.05")):
             continue
-        edges[(meta.quote, meta.base)] = Edge(meta.quote, meta.base, symbol, "buy", ask, fee)
-        edges[(meta.base, meta.quote)] = Edge(meta.base, meta.quote, symbol, "sell", bid, fee)
+        observed = getattr(tickers, "observed_at", {}).get(symbol)
+        edges[(meta.quote, meta.base)] = Edge(meta.quote, meta.base, symbol, "buy", ask, fee, observed)
+        edges[(meta.base, meta.quote)] = Edge(meta.base, meta.quote, symbol, "sell", bid, fee, observed)
     return edges
 
 
@@ -46,11 +50,17 @@ def discover_triangles(edges: dict[tuple[str, str], Edge], start: str):
 
 
 def screen_top_of_book(edges, routes, start_amount: Decimal,
-                       min_net_bps: Decimal) -> tuple[list[Opportunity], Decimal | None]:
+                       min_net_bps: Decimal, *, max_age_s=None, max_skew_s=None,
+                       diagnostics=None) -> tuple[list[Opportunity], Decimal | None]:
     result = []
     best_net_bps = None
     for route in routes:
         route_edges = tuple(edges[(route[index], route[index + 1])] for index in range(3))
+        code = observation_error(route_edges, max_age_s=max_age_s, max_skew_s=max_skew_s)
+        if code:
+            if diagnostics is not None:
+                diagnostics[code] = diagnostics.get(code, 0) + 1
+            continue
         amount = Decimal(start_amount)
         for edge in route_edges:
             amount = (amount / edge.price if edge.side == "buy" else amount * edge.price)
@@ -78,6 +88,34 @@ def _down(amount: Decimal, step: Decimal) -> Decimal:
     return (amount / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def observation_error(items, *, max_age_s, max_skew_s, now=None):
+    """A timestamp describes request start for REST, receipt for WebSocket."""
+    if max_age_s is None and max_skew_s is None:
+        return None
+    times = [item.observed_at for item in items]
+    if not times or any(stamp is None or not math.isfinite(stamp) for stamp in times):
+        return "MISSING_OBSERVATION_TIME"
+    now = time.monotonic() if now is None else now
+    if any(stamp > now for stamp in times):
+        return "INVALID_OBSERVATION_TIME"
+    if max_age_s is not None and now - min(times) > max_age_s:
+        return "STALE_QUOTES"
+    if max_skew_s is not None and max(times) - min(times) > max_skew_s:
+        return "QUOTE_SKEW"
+    return None
+
+
+def _walk_quantity(levels, quantity):
+    remaining, total = quantity, Decimal(0)
+    for level in levels:
+        take = min(level.quantity, remaining)
+        total += take * level.price
+        remaining -= take
+        if remaining <= 0:
+            return total
+    return None
+
+
 @dataclass(frozen=True)
 class SimulationResult:
     opportunity: Opportunity | None
@@ -89,10 +127,20 @@ class SimulationResult:
 def simulate_detailed(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
                       pairs: dict[str, PairMeta], start_amount: Decimal) -> SimulationResult:
     amount, route = Decimal(start_amount), [edges[0].source]
+    if not amount.is_finite() or amount <= 0:
+        return SimulationResult(None, "PAIR_RULES", detail="non-positive start")
+    inventory = {edges[0].source: amount}
     for leg, edge in enumerate(edges, 1):
         meta, book = pairs[edge.symbol], books[edge.symbol]
+        if (not book.bids or not book.asks
+                or any(not Decimal(level.price).is_finite() or not Decimal(level.quantity).is_finite()
+                       or level.price <= 0 or level.quantity <= 0
+                       for level in (*book.bids, *book.asks))
+                or book.bids[0].price > book.asks[0].price):
+            return SimulationResult(None, "INVALID_BOOK", leg, edge.symbol)
         if edge.side == "buy":
-            budget, remaining, gross = amount, amount, Decimal(0)
+            budget = _down(amount, Decimal(1).scaleb(-min(meta.quote_precision, 8)))
+            remaining, gross = budget, Decimal(0)
             for level in book.asks:
                 take = min(level.quantity, remaining / level.price)
                 gross += take
@@ -102,8 +150,10 @@ def simulate_detailed(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
             # quoteOrderQty is converted by the matching engine, but projected
             # output must still be conservative at base LOT_SIZE precision.
             gross = _down(gross, meta.base_step)
-            consumed = budget - max(remaining, Decimal(0))
             if remaining > Decimal("0.000000000001"):
+                return SimulationResult(None, "INSUFFICIENT_DEPTH", leg, edge.symbol)
+            consumed = _walk_quantity(book.asks, gross)
+            if consumed is None:
                 return SimulationResult(None, "INSUFFICIENT_DEPTH", leg, edge.symbol)
             if (gross < meta.min_qty or (meta.max_qty and gross > meta.max_qty)
                     or consumed < meta.min_notional
@@ -113,6 +163,7 @@ def simulate_detailed(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
             # The protected FOK/IOC attempts use LOT_SIZE. Market-only rules
             # are checked again if execution reaches the final fallback.
             sell = _down(amount, meta.base_step)
+            consumed = sell
             remaining, gross = sell, Decimal(0)
             for level in book.bids:
                 take = min(level.quantity, remaining)
@@ -129,11 +180,18 @@ def simulate_detailed(edges: tuple[Edge, Edge, Edge], books: dict[str, Book],
             if (gross < meta.min_notional
                     or (meta.max_notional is not None and gross > meta.max_notional)):
                 return SimulationResult(None, "PAIR_RULES", leg, edge.symbol)
+        inventory[edge.source] = inventory.get(edge.source, Decimal(0)) - consumed
         amount = gross * (Decimal(1) - edge.fee)
+        inventory[edge.target] = inventory.get(edge.target, Decimal(0)) + amount
         route.append(edge.target)
-    bps = (amount / start_amount - Decimal(1)) * BPS
+    end = inventory[route[0]]
+    unspent_start = end - amount
+    residuals = tuple(sorted((asset, value) for asset, value in inventory.items()
+                             if asset != route[0] and value > 0))
+    bps = (end / start_amount - Decimal(1)) * BPS
     return SimulationResult(
-        Opportunity(tuple(route), edges, start_amount, amount, bps, amount - start_amount),
+        Opportunity(tuple(route), edges, start_amount, end, bps, end - start_amount,
+                    unspent_start, residuals),
         "OK",
     )
 
@@ -199,7 +257,8 @@ def best_size(edges, books, pairs, minimum, maximum, min_net_bps):
 def best_size_detailed(edges, books, pairs, minimum, maximum, min_net_bps):
     best = None
     diagnostics = {"sizes": 0, "PAIR_RULES": 0, "INSUFFICIENT_DEPTH": 0,
-                   "BOOK_UNPROFITABLE": 0, "best_net_bps": None}
+                   "INVALID_BOOK": 0, "BOOK_UNPROFITABLE": 0, "best_net_bps": None,
+                   "best_unspent_start": None, "best_residuals": ()}
     for amount in conservative_size_grid(maximum, minimum):
         diagnostics["sizes"] += 1
         result = simulate_detailed(edges, books, pairs, amount)
@@ -210,6 +269,8 @@ def best_size_detailed(edges, books, pairs, minimum, maximum, min_net_bps):
         if (diagnostics["best_net_bps"] is None
                 or candidate.net_bps > diagnostics["best_net_bps"]):
             diagnostics["best_net_bps"] = candidate.net_bps
+            diagnostics["best_unspent_start"] = candidate.unspent_start
+            diagnostics["best_residuals"] = candidate.residuals
         if candidate.net_bps < min_net_bps:
             diagnostics["BOOK_UNPROFITABLE"] += 1
             continue
@@ -217,6 +278,8 @@ def best_size_detailed(edges, books, pairs, minimum, maximum, min_net_bps):
             best = candidate
     if best is not None:
         diagnostics["code"] = "ELIGIBLE"
+    elif diagnostics["INVALID_BOOK"]:
+        diagnostics["code"] = "INVALID_BOOK"
     elif diagnostics["BOOK_UNPROFITABLE"]:
         diagnostics["code"] = "BOOK_UNPROFITABLE"
     elif diagnostics["INSUFFICIENT_DEPTH"]:

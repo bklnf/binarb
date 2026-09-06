@@ -4,9 +4,17 @@ import json
 import logging
 import threading
 import time
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 
 logger = logging.getLogger(__name__)
+
+
+class TickerSnapshot(dict):
+    """Prices and their observation times captured under the same cache lock."""
+
+    def __init__(self, prices=(), *, observed_at=None):
+        super().__init__(prices)
+        self.observed_at = dict(observed_at or {})
 
 
 class BookTickerStream:
@@ -21,6 +29,7 @@ class BookTickerStream:
                               for symbol in group}
         self.url = url
         self._quotes: dict[str, tuple[Decimal, Decimal, float, str, int | None]] = {}
+        self._update_ids: dict[str, int] = {}
         self._health = {index: {"connected": False, "opened_at": None,
                                "last_message_at": None, "reconnects": 0}
                         for index in range(len(self.groups))}
@@ -34,6 +43,9 @@ class BookTickerStream:
         seen = time.monotonic() if observed_at is None else float(observed_at)
         with self._lock:
             for symbol, (bid, ask) in tickers.items():
+                if (symbol not in self._symbol_group or not bid.is_finite()
+                        or not ask.is_finite() or bid <= 0 or ask < bid):
+                    continue
                 current = self._quotes.get(symbol)
                 if current is None or current[2] <= seen:
                     self._quotes[symbol] = (bid, ask, seen, "REST", None)
@@ -55,19 +67,13 @@ class BookTickerStream:
     def snapshot(self, *, max_age_s=30.0):
         cutoff = time.monotonic() - max_age_s
         with self._lock:
-            return {symbol: (row[0], row[1]) for symbol, row in self._quotes.items()
-                    for seen in (row[2],)
-                    if (seen >= cutoff or self._group_is_fresh(symbol, cutoff))}
+            rows = {symbol: row for symbol, row in self._quotes.items() if row[2] >= cutoff}
+            return TickerSnapshot(
+                {symbol: (row[0], row[1]) for symbol, row in rows.items()},
+                observed_at={symbol: row[2] for symbol, row in rows.items()},
+            )
 
-    def _group_is_fresh(self, symbol, cutoff):
-        group = self._symbol_group.get(symbol)
-        if group is None:
-            return False
-        health = self._health[group]
-        return (health["connected"] and health["last_message_at"] is not None
-                and health["last_message_at"] >= cutoff)
-
-    def health(self):
+    def health(self, *, max_age_s=2.0):
         now = time.monotonic()
         with self._lock:
             websocket_quotes = sum(1 for row in self._quotes.values() if row[3] == "WS")
@@ -75,11 +81,14 @@ class BookTickerStream:
             connected = sum(1 for row in self._health.values() if row["connected"])
             last_messages = [row["last_message_at"] for row in self._health.values()
                              if row["last_message_at"] is not None]
+            ages = [now - row[2] for row in self._quotes.values()]
             return {"connected_groups": connected, "total_groups": len(self.groups),
                     "websocket_quotes": websocket_quotes, "rest_quotes": rest_quotes,
                     "last_message_age_s": (None if not last_messages
                                              else now - max(last_messages)),
-                    "reconnects": sum(row["reconnects"] for row in self._health.values())}
+                    "reconnects": sum(row["reconnects"] for row in self._health.values()),
+                    "stale_quotes": sum(age > max_age_s for age in ages),
+                    "oldest_quote_age_s": max(ages, default=None)}
 
     def ready(self, minimum=1):
         with self._lock:
@@ -108,19 +117,20 @@ class BookTickerStream:
     def _open(self, index, ws, symbols):
         with self._lock:
             row = self._health[index]
-            row.update(connected=True, opened_at=time.monotonic())
+            row.update(connected=True, opened_at=time.monotonic(), last_message_at=None)
         self._subscribe(ws, symbols)
 
     def _close(self, index):
         with self._lock:
             row = self._health[index]
-            row["connected"] = False
+            row.update(connected=False, last_message_at=None)
             row["reconnects"] += 1
             # A reconnect is not a snapshot protocol. Remove every quote from
             # the disconnected subscription so none can be treated as current
             # until a new event or the next REST seed arrives.
             for symbol in self.groups[index]:
                 self._quotes.pop(symbol.upper(), None)
+                self._update_ids.pop(symbol.upper(), None)
 
     @staticmethod
     def _subscribe(ws, symbols):
@@ -137,15 +147,18 @@ class BookTickerStream:
             row = json.loads(message)
             symbol, bid, ask = row["s"], Decimal(row["b"]), Decimal(row["a"])
             update_id = int(row["u"]) if row.get("u") is not None else None
-            if bid <= 0 or ask < bid:
+            if (not bid.is_finite() or not ask.is_finite() or bid <= 0 or ask < bid
+                    or self._symbol_group.get(symbol) != index):
                 return
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except (ValueError, TypeError, KeyError, DecimalException, json.JSONDecodeError):
             return
         with self._lock:
-            current = self._quotes.get(symbol)
-            if (update_id is not None and current is not None and current[4] is not None
-                    and update_id <= current[4]):
+            previous_id = self._update_ids.get(symbol)
+            if (update_id is not None and previous_id is not None
+                    and update_id <= previous_id):
                 return
+            if update_id is not None:
+                self._update_ids[symbol] = update_id
             now = time.monotonic()
             self._quotes[symbol] = (bid, ask, now, "WS", update_id)
             self._health[index]["last_message_at"] = now

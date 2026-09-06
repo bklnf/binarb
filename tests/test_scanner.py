@@ -1,10 +1,12 @@
 from decimal import Decimal
+from dataclasses import replace
+import random
 
 from binarb.models import Book, Edge, Level, PairMeta
 from binarb.scanner import (build_edges, discover_triangles, screen_top_of_book,
                             best_size_detailed, conservative_size_grid,
                             route_minimum_start, simulate,
-                            top_of_book_opportunities)
+                            simulate_detailed, top_of_book_opportunities)
 
 
 def meta(symbol, base, quote, minimum="0.001", notional="1"):
@@ -102,3 +104,67 @@ def test_detailed_sizing_exposes_pair_rule_rejection():
         edges, books, pairs, Decimal("1"), Decimal("4"), Decimal(0))
     assert candidate is None
     assert diagnostic["code"] == "PAIR_RULES"
+
+
+def cash_fixture():
+    pairs = {"AUSD": meta("AUSD", "A", "USD", minimum="1"),
+             "AB": meta("AB", "A", "B", minimum="1"),
+             "BUSD": meta("BUSD", "B", "USD", minimum="1")}
+    edges = (Edge("USD", "A", "AUSD", "buy", Decimal(1), Decimal(0)),
+             Edge("A", "B", "AB", "sell", Decimal(1), Decimal(0)),
+             Edge("B", "USD", "BUSD", "sell", Decimal("1.01"), Decimal(0)))
+    books = {symbol: Book((Level(price, Decimal(10000)),),
+                          (Level(price, Decimal(10000)),))
+             for symbol, price in [("AUSD", Decimal(1)), ("AB", Decimal(1)),
+                                   ("BUSD", Decimal("1.01"))]}
+    return pairs, edges, books
+
+
+def test_rounded_buy_retains_start_cash_instead_of_reporting_a_loss():
+    pairs, edges, books = cash_fixture()
+    result = simulate(edges, books, pairs, Decimal("10.99"))
+    assert result.unspent_start == Decimal(".99")
+    assert result.end_amount == Decimal("11.09")
+    assert result.profit == Decimal(".10")
+
+
+def test_multilevel_buy_recomputes_actual_rounded_notional():
+    pairs, edges, books = cash_fixture()
+    books["AUSD"] = Book((Level(Decimal(1), Decimal(100)),),
+                         (Level(Decimal(1), Decimal(5)), Level(Decimal(2), Decimal(100))))
+    result = simulate(edges, books, pairs, Decimal("10.99"))
+    assert result.unspent_start == Decimal("1.99")
+    assert result.end_amount == Decimal("9.06")
+    pairs["AUSD"] = replace(pairs["AUSD"], min_notional=Decimal(10))
+    rejected = simulate_detailed(edges, books, pairs, Decimal("10.99"))
+    assert (rejected.code, rejected.leg) == ("PAIR_RULES", 1)
+
+
+def test_start_sell_retains_unsold_start_asset():
+    pairs, edges, books = cash_fixture()
+    result = simulate((edges[1], edges[2], edges[0]), books, pairs, Decimal("10.99"))
+    assert result.unspent_start == Decimal(".99")
+    assert result.end_amount == Decimal("10.99")
+    assert dict(result.residuals) == {"USD": Decimal(".10")}
+    assert result.profit == 0
+
+
+def test_received_asset_fees_and_dust_are_not_credited_twice():
+    pairs, edges, books = cash_fixture()
+    edges = tuple(replace(edge, fee=Decimal(".01")) for edge in edges)
+    result = simulate(edges, books, pairs, Decimal("10.99"))
+    assert result.end_amount == Decimal("8.9892")
+    assert result.unspent_start == Decimal(".99")
+    assert dict(result.residuals) == {"A": Decimal(".9"), "B": Decimal(".91")}
+
+
+def test_cash_conservation_across_random_budget_rounding_boundaries():
+    pairs, edges, books = cash_fixture()
+    rng = random.Random(20260906)
+    for _ in range(200):
+        budget = Decimal(rng.randrange(200, 100000)) / 100
+        result = simulate(edges, books, pairs, budget)
+        spent = budget.to_integral_value(rounding="ROUND_DOWN")
+        assert result.end_amount == budget - spent + spent * Decimal("1.01")
+        assert result.profit == spent * Decimal(".01")
+        assert Decimal(0) <= result.unspent_start < 1

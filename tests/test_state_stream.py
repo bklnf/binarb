@@ -1,4 +1,5 @@
 import os
+import time
 from decimal import Decimal
 
 from binarb.market_stream import BookTickerStream
@@ -42,3 +43,32 @@ def test_archive_retention_is_bounded(tmp_path):
     os.utime(oldest, (100, 100))
     store.archive_retention_days = 1
     assert store.prune(now=100 + 86401) == 1
+
+
+def test_unrelated_symbol_activity_cannot_refresh_old_quote():
+    stream = BookTickerStream(["AUSDT", "BUSDT"])
+    stream.seed({"AUSDT": (Decimal(1), Decimal(1))}, observed_at=time.monotonic() - 60)
+    stream._health[0]["connected"] = True
+    stream._message('{"s":"BUSDT","b":"1","a":"1","u":1}')
+    snapshot = stream.snapshot(max_age_s=2)
+    assert "AUSDT" not in snapshot
+    assert "BUSDT" in snapshot
+    assert snapshot.observed_at.keys() == snapshot.keys()
+    assert stream.health()["stale_quotes"] == 1
+
+
+def test_rest_seed_preserves_websocket_update_watermark():
+    stream = BookTickerStream(["AUSDT"])
+    stream._message('{"s":"AUSDT","b":"2","a":"2","u":20}')
+    stream.seed({"AUSDT": (Decimal(3), Decimal(3))})
+    stream._message('{"s":"AUSDT","b":"1","a":"1","u":19}')
+    assert stream.snapshot()["AUSDT"] == (Decimal(3), Decimal(3))
+
+
+def test_unknown_symbols_and_non_finite_quotes_are_ignored():
+    stream = BookTickerStream(["AUSDT"])
+    for message in ['{"s":"XUSDT","b":"1","a":"1"}',
+                    '{"s":"AUSDT","b":"NaN","a":"1"}',
+                    '{"s":"AUSDT","b":"1","a":"Infinity"}']:
+        stream._message(message)
+    assert stream.snapshot() == {}

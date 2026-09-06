@@ -15,7 +15,9 @@ IDs, and exact fill-commission accounting.
   `BINANCE_LIVE_ACK=I_ACCEPT_LIVE_TRADING`; `scan-once` can never trade.
 - An all-market WebSocket cache retains one bid/ask tuple per symbol in memory,
   rejects out-of-order updates, reports connection health, and defaults to a
-  two-second freshness window.
+  two-second freshness window per symbol. Activity in another symbol never
+  refreshes an old quote. Routes also require observation timestamps within
+  `ARB_QUOTE_MAX_SKEW_S_BINANCE` (0.5 seconds by default) of each other.
   Raw ticks are never written. REST depth is requested only for profitable
   ticker candidates. A route's three books are requested concurrently and
   reused for rotated candidates within the scan before all levels are walked.
@@ -32,6 +34,17 @@ IDs, and exact fill-commission accounting.
   minimum executable start amount from all three pairs, and
   samples a dense geometric grid down to that exact floor. Immediately before leg 1, fresh balances and all
   three books rerun the complete grid and may resize the opportunity.
+  Simulation recomputes the spend for rounded buy quantities and credits cash
+  left in the starting asset. Intermediate residuals are reported without
+  assuming they can be liquidated. Fees remain conservatively deducted from
+  simulated received amounts; actual BNB commissions are accounted separately
+  from confirmed fills. Discount eligibility requires an available BNB reserve;
+  live BNB routes are revalidated at full fees because they may consume it.
+- Unfunded routes are rejected before requesting depth. A bounded worker pool
+  and fresh book reuse reduce confirmation overhead. Expired or incoherent
+  books cannot authorize entry, and an operator pause is checked again before
+  the first order. Every confirmed FOK/IOC/MARKET fill updates durable inventory
+  before the next attempt; partial or ambiguous recovery leaves the deal active.
 - Completed state records are capped at 2,000 files and 30 days by default.
   Docker logs rotate at 30 MB for the strategy and 10 MB for Telegram.
 - Healthy operation emits a `scan heartbeat` every 10 seconds by default,
@@ -39,6 +52,11 @@ IDs, and exact fill-commission accounting.
   signal, decision, and funded start balances. Candidate, depth, execution,
   fill, and recovery decisions are logged as they occur. Configure the cadence
   with `ARB_SCAN_LOG_INTERVAL_S_BINANCE`.
+  Heartbeats also include cumulative rejection codes, quote-age/skew exclusions,
+  depth request count, scan duration, and the best simulated book return.
+  “Depth checked” counts calculations; “Eligible” counts accepted opportunities.
+  With strict per-symbol freshness, coverage can fall between REST seeds when
+  quiet symbols do not update. The fresh-symbol count now reports that honestly.
 
 ## Commands
 
@@ -104,3 +122,5 @@ each free start balance; the sizing grid includes that full configured cap.
 Venue minimums and precision filters remain authoritative, so there is no
   invalid cross-asset "10 units" assumption. Restricted bridge assets can be
   removed with `ARB_EXCLUDED_ASSETS_BINANCE` (IDR by default for this account).
+
+Deployment and rollback steps are in [docs/deployment.md](docs/deployment.md).

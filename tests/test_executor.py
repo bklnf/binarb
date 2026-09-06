@@ -1,8 +1,14 @@
 from decimal import Decimal
+from dataclasses import replace
+import json
+import time
+
+import pytest
 
 from binarb.executor import Executor, client_id
 from binarb.models import Book, Edge, Fill, Level, Opportunity, PairMeta
 from binarb.state import StateStore
+from binarb.errors import AmbiguousOrderError, BinanceError, RecoveryRequired
 
 
 EDGES = (Edge("USD", "A", "AUSD", "buy", Decimal("10"), Decimal("0")),
@@ -23,9 +29,10 @@ class FakeClient:
         self.orders = []
     def test_commission(self, edge, amount): return Decimal(0)
     def order_book(self, symbol):
-        return {"AUSD": Book((Level(9, 100),), (Level(10, 100),)),
+        book = {"AUSD": Book((Level(9, 100),), (Level(10, 100),)),
                 "AB": Book((Level(2, 100),), (Level(2.1, 100),)),
                 "BUSD": Book((Level(6, 100),), (Level(6.1, 100),))}[symbol]
+        return replace(book, observed_at=time.monotonic())
     def balances(self): return dict(self.balance)
     def prepare_market_order(self, edge, amount): return {"amount": amount}
     def prepare_limit_order(self, edge, amount, price): return {"amount": amount, "price": price}
@@ -101,3 +108,99 @@ def test_full_fok_stops_leg_without_fallback(tmp_path):
     spent, output = executor._run_leg("deal", 1, EDGES[0], Decimal("10"), state)
     assert (spent, output) == (Decimal("10"), Decimal("1"))
     assert [order["policy"] for order in state["orders"]] == ["FOK"]
+
+
+def opportunity():
+    return Opportunity(("USD", "A", "B", "USD"), EDGES, Decimal("10"),
+                       Decimal("12"), Decimal("2000"), Decimal("2"))
+
+
+@pytest.mark.parametrize("age,skew,reason", [
+    (10, 0, "STALE_QUOTES"), (0, 1, "QUOTE_SKEW"),
+])
+def test_preflight_rejects_old_or_incoherent_books_without_orders(tmp_path, age, skew, reason):
+    client = FakeClient()
+    original = client.order_book
+    stamp = time.monotonic()
+    client.order_book = lambda symbol: replace(
+        original(symbol), observed_at=stamp - age - (skew if symbol == "AB" else 0))
+    result = Executor(client, StateStore(tmp_path), dry_run=False).execute(opportunity())
+    assert result["status"] == "REPRICE_UNPROFITABLE"
+    assert result["rejection_reason"] == reason
+    assert result["realized_pnl"] == 0
+    assert not client.orders
+
+
+def test_operator_pause_after_confirmation_prevents_entry(tmp_path):
+    client = FakeClient()
+    result = Executor(client, StateStore(tmp_path), dry_run=False,
+                      entry_allowed=lambda: False).execute(opportunity())
+    assert result["rejection_reason"] == "OPERATOR_PAUSED"
+    assert not client.orders
+
+
+def test_partial_fill_is_durable_when_later_policy_fails(tmp_path):
+    client, store = EscalatingClient(), StateStore(tmp_path)
+    def reject(*args):
+        raise BinanceError("market rejected")
+    client.new_market_order = reject
+    state = {"deal_id": "deal", "orders": [], "inventory": {}}
+    with pytest.raises(BinanceError):
+        Executor(client, store, dry_run=False)._run_leg("deal", 1, EDGES[0], Decimal(10), state)
+    saved = json.loads(store.path("deal").read_text())
+    assert Decimal(saved["inventory"]["A"]) == Decimal(".5")
+    assert Decimal(saved["actual_start_spent"]) == 5
+
+
+def test_recovery_of_partial_entry_has_cash_pnl_and_fees(tmp_path):
+    class Client(EscalatingClient):
+        def new_market_order(self, edge, amount, cid):
+            if edge.side == "buy":
+                raise BinanceError("remainder rejected")
+            fill = super().new_market_order(edge, amount, cid)
+            return replace(fill, commissions=(("BNB", Decimal(".001")),))
+        def edge(self, source, target, tickers):
+            if (source, target) == ("A", "USD"):
+                return Edge(source, target, "AUSD", "sell", Decimal(9), Decimal(0))
+            if (source, target) == ("BNB", "USD"):
+                return Edge(source, target, "BNBUSD", "sell", Decimal(100), Decimal(0))
+    client, store = Client(), StateStore(tmp_path)
+    with pytest.raises(RecoveryRequired):
+        Executor(client, store, dry_run=False, settlement_interval_s=0).execute(opportunity())
+    saved = json.loads(next(store.archive.glob("*.json")).read_text())
+    assert saved["status"] == "RECOVERED"
+    assert Decimal(saved["actual_start_spent"]) == 50
+    assert Decimal(saved["realized_pnl"]) == Decimal("-5.1")
+    assert not store.active()
+
+
+def test_partial_recovery_does_not_archive_or_retry_same_order(tmp_path):
+    class Client(FakeClient):
+        def new_limit_order(self, edge, amount, price, tif, cid):
+            if edge.symbol == "AB":
+                raise BinanceError("restricted symbol")
+            return super().new_limit_order(edge, amount, price, tif, cid)
+        def edge(self, source, target, tickers):
+            return Edge(source, target, "AUSD", "sell", Decimal(9), Decimal(0))
+        def new_market_order(self, edge, amount, cid):
+            return replace(self._filled(edge, amount / 2, cid, edge.price), status="EXPIRED")
+    client, store = Client(), StateStore(tmp_path)
+    with pytest.raises(RecoveryRequired):
+        Executor(client, store, dry_run=False, settlement_interval_s=0).execute(opportunity())
+    active = store.active()[0]
+    assert active["status"] == "RECOVERY_REQUIRED"
+    assert Decimal(active["inventory"]["A"]) == 5
+    assert len(client.orders) == 2
+    assert not list(store.archive.glob("*.json"))
+
+
+def test_ambiguous_recovery_stays_active(tmp_path):
+    client, store = FakeClient(), StateStore(tmp_path)
+    executor = Executor(client, store, dry_run=False)
+    client.edge = lambda *args: Edge("A", "USD", "AUSD", "sell", Decimal(9), Decimal(0))
+    def ambiguous(*args, **kwargs):
+        raise AmbiguousOrderError("unresolved recovery")
+    executor._place_and_resolve = ambiguous
+    state = {"deal_id": "deal", "orders": [], "inventory": {"A": Decimal(1)}}
+    assert executor._recover_to_start("deal", state, "USD") is False
+    assert state["ambiguous_order"] is True

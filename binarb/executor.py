@@ -10,7 +10,7 @@ from decimal import Decimal
 import requests
 
 from .errors import AmbiguousOrderError, BinanceError, RecoveryRequired
-from .scanner import best_size, route_minimum_start
+from .scanner import best_size, observation_error, route_minimum_start
 
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,8 @@ class Executor:
     def __init__(self, client, state_store, *, dry_run=True, poll_attempts=20,
                  poll_interval_s=.1, settlement_attempts=20, settlement_interval_s=.1,
                  auto_recover=True, min_net_bps=Decimal(0), max_slippage_bps=Decimal(15),
-                 balance_share=Decimal(1), min_size_share=Decimal("0.10")):
+                 balance_share=Decimal(1), min_size_share=Decimal("0.10"),
+                 max_quote_age_s=2.0, max_quote_skew_s=0.5, entry_allowed=None):
         self.client, self.state_store, self.dry_run = client, state_store, dry_run
         self.poll_attempts, self.poll_interval_s = poll_attempts, poll_interval_s
         self.settlement_attempts, self.settlement_interval_s = settlement_attempts, settlement_interval_s
@@ -33,6 +34,8 @@ class Executor:
         self.min_net_bps, self.max_slippage_bps = Decimal(min_net_bps), Decimal(max_slippage_bps)
         self.balance_share = Decimal(balance_share)
         self.min_size_share = Decimal(min_size_share)
+        self.max_quote_age_s, self.max_quote_skew_s = max_quote_age_s, max_quote_skew_s
+        self.entry_allowed = entry_allowed or (lambda: True)
 
     def execute(self, opportunity):
         deal_id = str(uuid.uuid4())
@@ -52,6 +55,14 @@ class Executor:
         self.state_store.save(deal_id, state)
         amount = opportunity.start_amount
         try:
+            fresh_balances = self.client.balances()
+            # Eligibility is not proof of an available commission reserve.
+            # BNB routes may consume that reserve, so reprice them at full fees.
+            if hasattr(self.client, "bnb_discount_active"):
+                self.client.bnb_discount_active = (
+                    self.client.bnb_discount_active
+                    and fresh_balances.get("BNB", Decimal(0)) > 0
+                    and "BNB" not in opportunity.route)
             # Exact side-specific fee probes are non-executing and also verify
             # commission configuration immediately before exposure is created.
             # A successful order/test is not proof that a live order is
@@ -72,16 +83,22 @@ class Executor:
             symbols = sorted({edge.symbol for edge in exact_edges})
             with ThreadPoolExecutor(max_workers=min(3, len(symbols))) as pool:
                 books = dict(zip(symbols, pool.map(self.client.order_book, symbols)))
-            fresh_available = (self.client.balances().get(opportunity.route[0], Decimal(0))
+            fresh_available = (fresh_balances.get(opportunity.route[0], Decimal(0))
                                * self.balance_share)
             minimum = max(fresh_available * self.min_size_share,
                           route_minimum_start(exact_edges, self.client.pairs))
             repriced = best_size(exact_edges, books, self.client.pairs, minimum,
                                  fresh_available, self.min_net_bps)
-            if (repriced is None or repriced.net_bps < self.min_net_bps or
+            quote_error = observation_error(
+                books.values(), max_age_s=self.max_quote_age_s, max_skew_s=self.max_quote_skew_s)
+            if (quote_error or not self.entry_allowed() or repriced is None
+                    or repriced.net_bps < self.min_net_bps or
                     abs(opportunity.net_bps - repriced.net_bps) > self.max_slippage_bps):
                 state.update(status="REPRICE_UNPROFITABLE",
-                             repriced_net_bps=repriced.net_bps if repriced else None)
+                             rejection_reason=quote_error or ("OPERATOR_PAUSED"
+                                 if not self.entry_allowed() else "REPRICE_UNPROFITABLE"),
+                             repriced_net_bps=repriced.net_bps if repriced else None,
+                             realized_pnl=Decimal(0), pnl_basis="NO_ORDERS")
                 self.state_store.finish(deal_id, state)
                 logger.warning("execution decision=REPRICE_UNPROFITABLE deal_id=%s route=%s "
                                "signal_net_bps=%s fresh_net_bps=%s",
@@ -92,18 +109,18 @@ class Executor:
             amount = repriced.start_amount
             state.update(start_amount=amount, expected_end_amount=repriced.end_amount,
                          expected_net_bps=repriced.net_bps, resized_from=original_size,
-                         resized_at=time.time(), fresh_available=fresh_available)
+                         resized_at=time.time(), fresh_available=fresh_available,
+                         projected_unspent_start=repriced.unspent_start,
+                         projected_residuals=dict(repriced.residuals))
             self.state_store.save(deal_id, state)
             logger.info("execution authorized deal_id=%s route=%s fresh_net_bps=%s",
                         deal_id, "->".join(opportunity.route), repriced.net_bps)
             for index, edge in enumerate(exact_edges, 1):
-                before = self.client.balances()
-                spent, output = self._run_leg(deal_id, index, edge, amount, state)
+                before = fresh_balances if index == 1 else self.client.balances()
+                spent, output = self._run_leg(deal_id, index, edge, amount, state,
+                                               entry_books=books if index == 1 else None)
                 if output <= 0 or spent <= 0:
                     raise RecoveryRequired(f"leg {index} has no confirmed positive fill")
-                if index == 1:
-                    state["actual_start_spent"] = spent
-                self._update_inventory(state, edge, spent, output)
                 state["status"] = f"LEG_{index}_FILLED"
                 self.state_store.save(deal_id, state)
                 logger.warning("leg complete deal_id=%s leg=%d symbol=%s side=%s "
@@ -123,6 +140,7 @@ class Executor:
                          external_commission_value_in_start=external_fee_value,
                          unvalued_external_commissions=unvalued_fees,
                          realized_pnl=(None if unvalued_fees else gross_pnl - external_fee_value),
+                         pnl_basis="CASH_FLOW_DUST_UNVALUED",
                          completed_at=time.time())
             self.state_store.finish(deal_id, state)
             logger.warning("execution complete deal_id=%s route=%s status=%s start_spent=%s "
@@ -140,7 +158,8 @@ class Executor:
             state.update(status="RECOVERING" if self.auto_recover else "RECOVERY_REQUIRED",
                          error=f"{type(exc).__name__}: {exc}")
             self.state_store.save(deal_id, state)
-            if self.auto_recover and self._recover_to_start(deal_id, state, opportunity.route[0]):
+            if (self.auto_recover and not state.get("recovery_attempted")
+                    and self._recover_to_start(deal_id, state, opportunity.route[0])):
                 realized = None
                 if state.get("actual_start_spent") is not None:
                     end = Decimal(str(state.get("inventory", {}).get(
@@ -155,6 +174,10 @@ class Executor:
                                  unvalued_external_commissions=unvalued_fees,
                                  realized_pnl=realized)
                 state.update(status="RECOVERED", completed_at=time.time())
+                if not state.get("orders"):
+                    state.update(realized_pnl=Decimal(0), pnl_basis="NO_ORDERS")
+                else:
+                    state["pnl_basis"] = "CASH_FLOW_DUST_UNVALUED"
                 self.state_store.finish(deal_id, state)
                 logger.exception("execution failed and recovered deal_id=%s route=%s "
                                  "realized_pnl=%s",
@@ -166,7 +189,7 @@ class Executor:
                                  deal_id, "->".join(opportunity.route))
             raise RecoveryRequired(f"deal {deal_id}: {state['status']}: {exc}") from exc
 
-    def _run_leg(self, deal_id, leg, edge, amount, state):
+    def _run_leg(self, deal_id, leg, edge, amount, state, *, entry_books=None):
         remaining, spent_total, output_total = Decimal(amount), Decimal(0), Decimal(0)
         for policy in ("FOK", "IOC", "MARKET"):
             if remaining <= 0:
@@ -177,6 +200,9 @@ class Executor:
                     self.client.prepare_market_order(edge, remaining)
                 else:
                     book = self.client.order_book(edge.symbol)
+                    if observation_error((book,), max_age_s=self.max_quote_age_s,
+                                         max_skew_s=self.max_quote_skew_s):
+                        raise RecoveryRequired("leg book is stale or missing its observation time")
                     price = book.asks[0].price if edge.side == "buy" else book.bids[0].price
                     self.client.prepare_limit_order(edge, remaining, price)
             except ValueError as exc:
@@ -184,6 +210,11 @@ class Executor:
                             "remaining=%s reason=%s", deal_id, leg, policy, edge.symbol,
                             remaining, exc)
                 continue
+            if entry_books is not None and spent_total == 0:
+                code = observation_error(entry_books.values(), max_age_s=self.max_quote_age_s,
+                                         max_skew_s=self.max_quote_skew_s)
+                if code or not self.entry_allowed():
+                    raise RecoveryRequired(code or "operator paused before entry")
             try:
                 fill = self._place_and_resolve(deal_id, f"{leg}-{policy.lower()}", edge,
                                                remaining, state, policy=policy, price=price)
@@ -194,16 +225,21 @@ class Executor:
                          - fill.commission(edge.target), Decimal(0))
             spent = ((fill.cost if edge.side == "buy" else fill.volume)
                      + fill.commission(edge.source))
-            if spent > remaining * Decimal("1.00000001"):
-                raise RecoveryRequired(f"leg {leg} {policy} spent beyond persisted budget")
-            spent = min(spent, remaining)
             spent_total += spent
             output_total += output
             remaining = max(Decimal(amount) - spent_total, Decimal(0))
             state["orders"][-1].update(input_spent=spent, net_output=output,
                                         input_remaining=remaining)
             self._record_commissions(state, fill, edge)
+            # Record every confirmed attempt before trying another policy.
+            # A later rejection must not hide an earlier partial fill.
+            self._update_inventory(state, edge, spent, output)
+            if leg == 1:
+                state["actual_start_spent"] = (
+                    Decimal(str(state.get("actual_start_spent", 0))) + spent)
             self.state_store.save(deal_id, state)
+            if spent_total > Decimal(amount):
+                raise RecoveryRequired(f"leg {leg} {policy} spent beyond persisted budget")
             logger.warning("leg attempt deal_id=%s leg=%s policy=%s symbol=%s status=%s "
                            "input_spent=%s net_output=%s remaining=%s",
                            deal_id, leg, policy, edge.symbol, fill.status, spent, output, remaining)
@@ -270,7 +306,12 @@ class Executor:
         except (requests.RequestException, BinanceError) as exc:
             if isinstance(exc, BinanceError) and not exc.ambiguous:
                 raise
-            fill = self._resolve_client_order(edge.symbol, cid)
+            try:
+                fill = self._resolve_client_order(edge.symbol, cid)
+            except Exception as resolve_error:
+                raise AmbiguousOrderError(
+                    f"leg {leg} placement could not be resolved ({type(resolve_error).__name__})"
+                ) from resolve_error
             if fill is None:
                 raise AmbiguousOrderError(f"leg {leg} placement outcome unknown: {exc}") from exc
             logger.warning("order placement response recovered deal_id=%s leg=%s symbol=%s "
@@ -279,14 +320,19 @@ class Executor:
         record.update(order_id=fill.order_id, status=fill.status)
         self.state_store.save(deal_id, state)
         if not fill.terminal:
-            fill = self._wait_terminal(edge.symbol, fill.order_id)
+            try:
+                fill = self._wait_terminal(edge.symbol, fill.order_id)
+            except Exception as poll_error:
+                raise AmbiguousOrderError(
+                    f"leg {leg} terminal state unknown ({type(poll_error).__name__})"
+                ) from poll_error
         if fill is None:
             raise AmbiguousOrderError(f"order {record.get('order_id')} has no readable terminal state")
         record.update(status=fill.status, filled_volume=fill.volume, filled_cost=fill.cost,
                       commissions=dict(fill.commissions))
         self.state_store.save(deal_id, state)
         if fill.symbol != edge.symbol or fill.side != edge.side:
-            raise RecoveryRequired("resolved order identity differs from persisted intent")
+            raise AmbiguousOrderError("resolved order identity differs from persisted intent")
         return fill
 
     def _resolve_client_order(self, symbol, cid):
@@ -322,6 +368,7 @@ class Executor:
         return False
 
     def _recover_to_start(self, deal_id, state, start):
+        state["recovery_attempted"] = True
         positions = [(asset, Decimal(str(amount))) for asset, amount in state["inventory"].items()
                      if asset != start and Decimal(str(amount)) > 0]
         if not positions:
@@ -346,9 +393,25 @@ class Executor:
                 spent = (fill.cost if edge.side == "buy" else fill.volume) + fill.commission(edge.source)
                 self._record_commissions(state, fill, edge)
                 self._update_inventory(state, edge, spent, output)
+                self.state_store.save(deal_id, state)
+                remainder = Decimal(str(state["inventory"].get(asset, 0)))
+                if remainder > 0:
+                    try:
+                        self.client.prepare_market_order(edge, remainder)
+                    except ValueError:
+                        state.setdefault("residual_dust", {})[asset] = remainder
+                    else:
+                        # Do not claim flattening after a partial market fill.
+                        state.setdefault("recovery_errors", []).append(
+                            f"{asset}: executable remainder after recovery")
+                        ok = False
                 logger.warning("recovery fill deal_id=%s asset=%s target=%s order_id=%s "
                                "input_spent=%s net_output=%s",
                                deal_id, asset, start, fill.order_id, spent, output)
+            except AmbiguousOrderError as exc:
+                state.update(ambiguous_order=True)
+                state.setdefault("recovery_errors", []).append(f"{asset}: {exc}")
+                return False
             except Exception as exc:
                 logger.exception("recovery failed for %s", asset)
                 state.setdefault("recovery_errors", []).append(f"{asset}: {exc}")

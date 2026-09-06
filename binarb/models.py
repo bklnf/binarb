@@ -34,6 +34,7 @@ class Edge:
     side: str
     price: Decimal
     fee: Decimal
+    observed_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class Level:
 class Book:
     bids: tuple[Level, ...]
     asks: tuple[Level, ...]
+    observed_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,10 @@ class Opportunity:
     end_amount: Decimal
     net_bps: Decimal
     profit: Decimal
+    # Cash left in the starting asset is fully valued. Intermediate dust is
+    # reported separately and receives no speculative liquidation credit.
+    unspent_start: Decimal = Decimal(0)
+    residuals: tuple[tuple[str, Decimal], ...] = ()
 
 
 @dataclass(frozen=True)

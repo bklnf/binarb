@@ -85,8 +85,23 @@ def test_test_commission_applies_verified_bnb_discount():
                                       "discountAsset": "BNB", "discount": "0.75"}})
     client = BinanceClient("key", "secret", session=Session([response]))
     client.pairs = {"AUSDT": pair()}
+    client.bnb_discount_active = True
     edge = Edge("USDT", "A", "AUSDT", "buy", Decimal("10"), Decimal(".001"))
     assert client.test_commission(edge, Decimal("5")) == Decimal(".00075")
+
+
+def test_discount_eligibility_without_reserve_uses_full_fee():
+    response = Response({"standardCommissionForOrder": {"taker": ".001"},
+                         "taxCommissionForOrder": {"taker": ".0001"},
+                         "specialCommissionForOrder": {"taker": ".0002"},
+                         "discount": {"enabledForAccount": True, "enabledForSymbol": True,
+                                      "discountAsset": "BNB", "discount": ".75"}})
+    client = BinanceClient("key", "secret", session=Session([response, response]))
+    client.pairs = {"AUSDT": pair()}
+    edge = Edge("USDT", "A", "AUSDT", "buy", Decimal(10), Decimal(".001"))
+    assert client.test_commission(edge, Decimal(5)) == Decimal(".0013")
+    client.bnb_discount_active = True
+    assert client.test_commission(edge, Decimal(5)) == Decimal(".00105")
 
 
 def test_load_account_fees_prefers_symbol_specific_taker_rates():
