@@ -8,9 +8,12 @@ def _check(response):
     raise RuntimeError(f"Telegram Bot API returned HTTP {response.status_code}{detail}")
 def send_message(text):
     token, chat = _env("TG_BOT_TOKEN"), _env("TG_CHAT_ID")
-    if not token or not chat: return
+    if not token or not chat: return False
     response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat, "text": text}, timeout=10); _check(response)
+    if response.json().get("ok") is not True:
+        raise RuntimeError("Telegram rejected sendMessage")
+    return True
 class TelegramPoller:
     def __init__(self): self.token, self.chat, self.offset = _env("TG_BOT_TOKEN"), _env("TG_CHAT_ID"), 0
     def poll(self, *, timeout, min_date):

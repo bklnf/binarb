@@ -52,7 +52,9 @@ def reference_symbols(edges, profiles, pairs, *, balances,
     if balances.get('BNB', D(0)) <= 0 or not any(
             p.bnb_eligible and p.effective(True) > 0 for p in profiles):
         return symbols
-    assets = {e.source for e in edges}
+    # Maintenance also plans single conversions, whose target is not another
+    # edge's source as it is in a closed triangle.
+    assets = {asset for e in edges for asset in (e.source, e.target)}
     if 'BNB' in assets:
         return symbols
     # One bridge is sufficient because the route itself connects all assets.

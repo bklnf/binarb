@@ -105,6 +105,7 @@ BotFather's `/setcommands` editor:
 barb_start - 🟢 Resume Binance triangle scanning and execution
 barb_stop - 🟡 Pause new entries; in-flight recovery continues
 barb_status - 📊 Show balances, candidates, mode, and last result
+balances - 💰 Show Spot balances worth at least $2 per currency
 barb_clear - 🧹 Archive unresolved local state and remain paused
 ```
 
@@ -112,11 +113,27 @@ barb_clear - 🧹 Archive unresolved local state and remain paused
   override dry-run mode or the separate live-trading acknowledgement.
 - `/barb_stop` prevents new opportunities from entering execution. An order
   sequence or recovery already in progress is allowed to finish.
+- `/balances` fetches a fresh Binance Spot account snapshot and lists currencies
+  worth at least $2 alphabetically, with available, locked, and total quantities
+  and approximate USD value. The filter uses the unrounded value of free plus
+  locked funds, using USDT as a USD proxy and market paths up to three hops,
+  before fees. Unpriced holdings are omitted with a separate count. Long lists
+  are split across messages. It works while the strategy is paused and uses only
+  read-only account and market requests.
 - `/barb_status` reports dry/live mode, desired state, monitored start assets,
   total fee-adjusted USD-equivalent balance (including locked assets), ticker
   and triangle counts, candidate count, and the most recent decision or error.
   Assets without a three-hop USDT valuation are counted explicitly. A delayed
   heartbeat is clearly marked `STALE`.
+- Completed triangles and filled recoveries generate Telegram messages containing
+  the route, deal ID, outcome and realized PnL after recorded commissions.
+  A durable SQLite outbox retries delivery independently of trading. Delivery is
+  at least once: a crash after Telegram accepts a message can duplicate that deal
+  ID. `/barb_status` includes completed-triangle counts, realized PnL by starting
+  asset including recovery losses, and a USDT conversion when available. Unknown
+  fees/PnL remain unknown, and intermediate dust is unvalued. Archive history is
+  imported silently at startup; previously pruned history cannot be recovered.
+  New totals survive restarts and archive pruning in `data/trade_reports.sqlite3`.
 - `/barb_clear` pauses the strategy and archives all unresolved local deal
   records as operator-cleared. It never places or cancels an exchange order and
   does not rebalance Binance inventory; inspect the account before using it on
@@ -131,14 +148,52 @@ docker compose --profile operator up -d tg-gateway
 
 ## Configuration
 
-Copy `.env.example` settings into the secret `.env`. Defaults monitor funded
-stablecoin, crypto-hub, and fiat start assets. The configured cap is 100% of
+Copy `.env.example` settings into the secret `.env`. Defaults monitor only
+USDC as the starting and ending asset for every triangle. Other assets can still be triangle
+intermediates. The configured cap is 100% of
 each free start balance; the sizing grid includes that full configured cap.
 Venue minimums and precision filters remain authoritative, so there is no
   invalid cross-asset "10 units" assumption. Restricted bridge assets can be
   removed with `ARB_EXCLUDED_ASSETS_BINANCE` (IDR by default for this account).
 
 Deployment and rollback steps are in [docs/deployment.md](docs/deployment.md).
+
+With `ARB_REBALANCE_ENABLED_BINANCE=true`, the first running maintenance check
+consolidates executable holdings into USDC. Subsequent checks run every 300
+seconds by default and clean up any executable non-USDC holdings, even below the
+20% relative drift threshold. The USDC target value is the priced total Spot
+account value minus the $10 BNB reserve. BNB is the exception: only executable
+excess above its reserve target is consolidated.
+USD values and reserve settings retain USDT as a valuation proxy; this does not
+require holding USDT, and there is no assumed exact USDC/USD parity. The preview
+reports account and accessible target values, consolidation paths and holdings
+below pair minimums. Unpriced holdings are reported separately; locked balances
+are valued but never spent. Dust and restricted holdings may remain.
+
+Maintenance converts available non-target assets through permitted paths into
+USDC. BNB replenishment spends USDC and runs before other conversions: the default
+reserve target is $10 and replenishment floor is $3. Entries are suspended while
+the reserve is below its floor. If free USDC cannot fund replenishment,
+maintenance reports a partial result and entries stay blocked. Reserve monitoring
+occurs at most every 30 seconds; its USD value can move between checks. Rebalance
+orders use fresh LIMIT/FOK prices and the existing 15 bps price-change allowance.
+Minimum-size changes are skipped. Maintenance commissions are not included in
+the triangle realized-PnL total.
+
+Maintenance and triangle execution run serially, respect operator pause, and
+share the durable active-deal gate. Every maintenance order has a persisted,
+deterministic client ID; unresolved outcomes block further trading. Known partial
+conversions remain in the account and are reconsidered at the next interval.
+A definitive account-permission rejection blocks that symbol and marks the pass
+partial, but other cleanup conversions can continue.
+The rejection is persisted and shown in `/barb_status`; ambiguous order outcomes
+still stop the entire pass and require reconciliation.
+Maintenance state is archived with `kind=REBALANCE` and cadence is persisted in
+`data/rebalance.json`. Neither dry-run nor the read-only preview places orders:
+
+```bash
+docker compose run --rm --no-deps binarb python -m binarb rebalance-plan
+```
 
 Offline replay requires no credentials or network:
 

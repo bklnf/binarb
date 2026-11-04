@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import logging
+import json
 import math
 import os
 import shlex
@@ -78,6 +79,9 @@ class Settings:
     confirmation_candidates_per_start: int
     confirmation_candidates_total: int
     quote_max_skew_s: float = 0.5
+    rebalance_enabled: bool = False
+    rebalance_interval_s: float = 300.0
+    rebalance_threshold: Decimal = Decimal('0.20')
 
     @classmethod
     def load(cls, *, permit_live=False):
@@ -85,7 +89,7 @@ class Settings:
         settings = cls(
             tuple(dict.fromkeys(item.strip().upper() for item in _env(
                 "ARB_START_CURRENCIES_BINANCE",
-                "USDT,USDC,FDUSD,BTC,ETH,BNB,EUR,TRY,BRL,JPY,MXN,ZAR"
+                "USDC"
             ).split(",") if item.strip())),
             frozenset(item.strip().upper() for item in _env(
                 "ARB_EXCLUDED_ASSETS_BINANCE", "IDR"
@@ -110,13 +114,16 @@ class Settings:
             int(_env("ARB_CONFIRMATION_CANDIDATES_PER_START_BINANCE", "3")),
             int(_env("ARB_CONFIRMATION_CANDIDATES_TOTAL_BINANCE", "12")),
             float(_env("ARB_QUOTE_MAX_SKEW_S_BINANCE", "0.5")),
+            _bool("ARB_REBALANCE_ENABLED_BINANCE", False),
+            float(_env("ARB_REBALANCE_INTERVAL_S_BINANCE", "300")),
+            Decimal(_env("ARB_REBALANCE_THRESHOLD_BINANCE", "0.20")),
         )
         for name in ("min_net_bps", "balance_share", "min_size_share", "max_slippage_bps",
-                     "bnb_replenish_floor_usdt", "bnb_replenish_target_usdt"):
+                     "bnb_replenish_floor_usdt", "bnb_replenish_target_usdt", "rebalance_threshold"):
             if not getattr(settings, name).is_finite():
                 raise ValueError(f"{name} must be finite")
         for name in ("scan_interval_s", "ticker_max_age_s", "rest_seed_interval_s",
-                     "scan_log_interval_s", "quote_max_skew_s"):
+                     "scan_log_interval_s", "quote_max_skew_s", "rebalance_interval_s"):
             value = getattr(settings, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -138,6 +145,15 @@ class Settings:
             raise ValueError("confirmation candidates per start must be positive")
         if settings.confirmation_candidates_total <= 0:
             raise ValueError("total confirmation candidates must be positive")
+        if not Decimal(0) < settings.rebalance_threshold < 1:
+            raise ValueError('rebalance threshold must be in (0,1)')
+        if settings.rebalance_enabled:
+            if settings.start_currencies != ('USDC',):
+                raise ValueError('rebalancing requires USDC as the only start currency')
+            if not settings.use_bnb_fee_discount or not settings.bnb_replenish_enabled:
+                raise ValueError('rebalancing requires BNB reserve maintenance')
+            if settings.bnb_replenish_floor_usdt <= 0:
+                raise ValueError('rebalancing requires a positive BNB reserve floor')
         if not dry_run and permit_live and _env("BINANCE_LIVE_ACK") != LIVE_ACK:
             raise RuntimeError(f"live mode requires BINANCE_LIVE_ACK={LIVE_ACK}")
         return settings
@@ -177,26 +193,30 @@ def maintain_bnb_fee_reserve(client, settings, tickers, balances):
         logger.warning("BNB fee reserve below floor value_usdt=%s floor_usdt=%s", bnb_value,
                        settings.bnb_replenish_floor_usdt)
         return False
-    edge = client.edge("USDT", "BNB", tickers)
-    available = balances.get("USDT", Decimal(0))
-    budget = min(settings.bnb_replenish_target_usdt - bnb_value, available)
+    edge = client.edge("USDC", "BNB", tickers)
+    usdc_prices = tickers.get("USDCUSDT")
+    if not usdc_prices or usdc_prices[0] <= 0:
+        logger.warning("BNB fee replenish skipped: no USDC valuation")
+        return False
+    available = balances.get("USDC", Decimal(0))
+    budget = min((settings.bnb_replenish_target_usdt - bnb_value) / usdc_prices[0], available)
     if edge is None or budget <= 0:
-        logger.warning("BNB fee replenish skipped: no usable USDT route or balance")
+        logger.warning("BNB fee replenish skipped: no usable USDC route or balance")
         return False
     try:
         client.prepare_market_order(edge, budget)
     except ValueError as exc:
-        logger.warning("BNB fee replenish skipped budget_usdt=%s: %s", budget, exc)
+        logger.warning("BNB fee replenish skipped budget_usdc=%s: %s", budget, exc)
         return False
     token = f"barb-fee-bnb-{time.time_ns()}"[:36]
     fill = client.new_market_order(edge, budget, token)
     acquired = max(fill.volume - fill.commission("BNB"), Decimal(0))
-    logger.warning("BNB fee reserve replenished spent_usdt=%s acquired_bnb=%s target_usdt=%s",
+    logger.warning("BNB fee reserve replenished spent_usdc=%s acquired_bnb=%s target_usdt=%s",
                    fill.cost, acquired, settings.bnb_replenish_target_usdt)
     try:
         from .telegram import send_message
         send_message("💎 BNB fee reserve replenished\n"
-                     f"Spent: {fill.cost} USDT\nAcquired: {acquired} BNB\n"
+                     f"Spent: {fill.cost} USDC\nAcquired: {acquired} BNB\n"
                      f"Target: ${settings.bnb_replenish_target_usdt}")
     except Exception:
         logger.exception("BNB fee replenish notification failed")
@@ -499,6 +519,10 @@ def status_text(settings, runtime):
         total_text += f" ({unpriced} unpriced assets)"
     discount_text = "💎 BNB fee discount: " + (
         "ON" if runtime.get("bnb_fee_discount_active") else "OFF")
+    pnl = runtime.get('realized_pnl_by_asset', {})
+    pnl_text = ', '.join(f'{Decimal(str(value)):+.8f} {asset}' for asset, value in sorted(pnl.items())) or 'none recorded'
+    pnl_usd = runtime.get('realized_pnl_usdt', '0')
+    pnl_missing = runtime.get('pnl_usdt_unvalued_trades', 0)
     return "\n".join(("🔺 Binance triangle arb", f"Mode: {mode}",
         f"State: {state_icon} {desired.upper()}",
         total_text, f"💰 Starts: {','.join(settings.start_currencies)}",
@@ -512,6 +536,12 @@ def status_text(settings, runtime):
         f"🔬 Depth checked: {runtime.get('confirmed_candidates', 'n/a')} this scan / "
         f"{runtime.get('total_confirmed_candidates', 0)} total",
         f"✅ Eligible: {runtime.get('total_book_candidates', 0)} total",
+        f"🏁 Completed triangles: {runtime.get('completed_trades', 0)}",
+        f"💰 Realized PnL (including recoveries): {pnl_text}",
+        f"USDT subtotal (valued trades): {Decimal(str(pnl_usd)):+.6f}; {pnl_missing} trades unvalued",
+        f"Unknown PnL: {runtime.get('pnl_unknown_trades', 0)} trades; dust unvalued",
+        f"⚖️ Rebalance: {runtime.get('rebalance_status', 'not checked')}",
+        *((f"⚠️ Rebalance error: {runtime['rebalance_error']}",) if runtime.get('rebalance_error') else ()),
         f"🚫 Rejections (total): {runtime.get('total_rejection_codes', {})}",
         f"⏱ Quote exclusions (total): {runtime.get('total_quote_rejections', {})}",
         discount_text,
@@ -636,10 +666,21 @@ def main(argv=None):
     op.add_argument("--max-usdt", type=Decimal, default=Decimal("5.5"))
     op.add_argument("--recover-btc", type=Decimal, default=Decimal(0))
     sub.add_parser("scan-once"); sub.add_parser("stream-probe"); sub.add_parser("run")
+    sub.add_parser('rebalance-plan', help='Read-only allocation preview; never submits orders')
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, _env("ARB_LOG_LEVEL", "INFO").upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.load(permit_live=args.command == "run")
+    if args.command == 'rebalance-plan':
+        from .rebalance import Rebalancer
+        from .research_sample import restrict_to_observation
+        client = make_client()
+        restrict_to_observation(client)
+        client.sync_time()
+        client.load_pair_metadata()
+        client.load_account_fees()
+        print(json.dumps(Rebalancer(client, settings).preview(), default=str, indent=2))
+        return 0
     if args.command == "probe": return probe(make_client(), settings, validate=args.validate_order)
     if args.command == "order-probe":
         return order_probe(make_client(), execute=args.execute, ack=args.ack,
@@ -661,6 +702,13 @@ def main(argv=None):
     stream.seed(seed, observed_at=min(seed.observed_at.values(), default=time.monotonic()))
     stream.start()
     runtime = {"pairs": len(client.pairs), "last_decision": "STARTED", "scan_count": 0}
+    from .reporting import TradeReports
+    from .rebalance import Rebalancer
+    reports = TradeReports(settings.state_dir)
+    reports.import_archives(settings.state_dir)
+    runtime.update(reports.summary())
+    rebalancer = Rebalancer(client, settings)
+    next_maintenance = 0.0
     update_portfolio_runtime(runtime, client, seed, total_balances)
     started, last_heartbeat, last_seed, balance_at = time.time(), 0., time.monotonic(), 0.
     last_scan_log, last_control_state = 0., None
@@ -675,14 +723,20 @@ def main(argv=None):
             health_tickers = stream.snapshot(max_age_s=settings.ticker_max_age_s)
             runtime.update(stream.health(max_age_s=settings.ticker_max_age_s), tickers=len(health_tickers))
             if now - last_heartbeat >= 2:
+                runtime.update(reports.summary())
                 cp.write_heartbeat(control["desired_state"], status_text(settings, runtime), runtime,
                                    started_at=started); last_heartbeat = now
             if control["desired_state"] == cp.PAUSED:
                 time.sleep(min(settings.scan_interval_s, 1)); continue
+            if _store(settings).active():
+                runtime['last_decision'] = 'RECOVERY_REQUIRED'
+                time.sleep(1)
+                continue
             if now - last_seed >= settings.rest_seed_interval_s:
                 seed_started = time.monotonic()
                 try:
-                    stream.seed(client.tickers(), observed_at=seed_started)
+                    seed = client.tickers()
+                    stream.seed(seed, observed_at=seed_started)
                 except RateLimitError as exc:
                     _handle_rate_limit(exc, runtime); continue
                 last_seed = now
@@ -696,11 +750,42 @@ def main(argv=None):
                 except RateLimitError as exc:
                     _handle_rate_limit(exc, runtime); continue
             fresh_tickers = stream.snapshot(max_age_s=settings.ticker_max_age_s)
+            # Maintenance and triangles share one loop and the active-deal gate.
+            if settings.rebalance_enabled and now >= next_maintenance:
+                next_maintenance = now + min(30, settings.rebalance_interval_s)
+                try:
+                    bnb_price = seed.get('BNBUSDT', (Decimal(0),))[0]
+                    reserve_low = balances.get('BNB', Decimal(0)) * bnb_price < settings.bnb_replenish_floor_usdt
+                    due = rebalancer.due()
+                    if due or reserve_low:
+                        maintenance = rebalancer.run(reserve_only=not due)
+                        runtime['rebalance_status'] = maintenance['status']
+                        runtime['rebalance_error'] = maintenance.get('error')
+                        balance_at = 0
+                        continue
+                except RateLimitError as exc:
+                    _handle_rate_limit(exc, runtime); continue
+                except Exception as exc:
+                    runtime.update(rebalance_status='REBALANCE_ERROR',
+                                   rebalance_error=f'{type(exc).__name__}: {exc}',
+                                   last_error=f'{type(exc).__name__}: {exc}')
+                    logger.exception('rebalance maintenance failed')
+                    continue
             if refresh_balances:
-                bnb_discount_active = maintain_bnb_fee_reserve(client, settings, fresh_tickers, balances)
+                if settings.rebalance_enabled:
+                    prices = seed.get('BNBUSDT')
+                    bnb_discount_active = bool(prices and balances.get('BNB', Decimal(0)) * prices[0]
+                                               >= settings.bnb_replenish_floor_usdt)
+                    client.set_bnb_discount_active(bnb_discount_active)
+                else:
+                    bnb_discount_active = maintain_bnb_fee_reserve(client, settings, fresh_tickers, balances)
                 runtime["bnb_fee_discount_active"] = bnb_discount_active
                 if not bnb_discount_active and settings.bnb_replenish_enabled and not settings.dry_run:
                     balance_at = 0
+            if settings.rebalance_enabled and not runtime.get('bnb_fee_discount_active'):
+                runtime['last_decision'] = 'BNB_RESERVE_REQUIRED'
+                time.sleep(settings.scan_interval_s)
+                continue
             try:
                 result = run_once(client, settings, fresh_tickers, balances,
                                   permit_live=True, runtime=runtime)

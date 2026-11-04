@@ -108,6 +108,10 @@ class StateStore:
     def finish(self, deal_id, state):
         self.archive.mkdir(parents=True, exist_ok=True)
         self.save(deal_id, state)
+        # Record PnL/outbox before retiring active state or pruning old archives.
+        # A persistence failure leaves a visible active record and blocks entry.
+        from .reporting import TradeReports
+        TradeReports(self.directory).record(state)
         os.replace(self.path(deal_id), self.archive / f"{deal_id}.json")
         self.prune()
 

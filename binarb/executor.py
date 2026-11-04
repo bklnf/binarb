@@ -142,6 +142,7 @@ class Executor:
                          realized_pnl=(None if unvalued_fees else gross_pnl - external_fee_value),
                          pnl_basis="CASH_FLOW_DUST_UNVALUED",
                          completed_at=time.time())
+            self._value_pnl_usdt(state)
             self.state_store.finish(deal_id, state)
             logger.warning("execution complete deal_id=%s route=%s status=%s start_spent=%s "
                            "end_amount=%s realized_pnl=%s",
@@ -178,6 +179,7 @@ class Executor:
                     state.update(realized_pnl=Decimal(0), pnl_basis="NO_ORDERS")
                 else:
                     state["pnl_basis"] = "CASH_FLOW_DUST_UNVALUED"
+                self._value_pnl_usdt(state)
                 self.state_store.finish(deal_id, state)
                 logger.exception("execution failed and recovered deal_id=%s route=%s "
                                  "realized_pnl=%s",
@@ -188,6 +190,23 @@ class Executor:
                 logger.exception("execution failed recovery_required deal_id=%s route=%s",
                                  deal_id, "->".join(opportunity.route))
             raise RecoveryRequired(f"deal {deal_id}: {state['status']}: {exc}") from exc
+
+    def _value_pnl_usdt(self, state):
+        pnl = state.get('realized_pnl')
+        if pnl is None:
+            return
+        asset = state['route'][0]
+        if asset == 'USDT':
+            state['realized_pnl_usdt'] = pnl
+            return
+        try:
+            edge = self.client.edge(asset, 'USDT', self.client.tickers())
+            if edge is not None:
+                state['realized_pnl_usdt'] = (Decimal(str(pnl)) / edge.price if edge.side == 'buy'
+                                              else Decimal(str(pnl)) * edge.price)
+                state['pnl_usdt_valued_at'] = time.time()
+        except Exception:
+            logger.warning('PnL USD conversion unavailable deal_id=%s', state['deal_id'])
 
     def _run_leg(self, deal_id, leg, edge, amount, state, *, entry_books=None):
         remaining, spent_total, output_total = Decimal(amount), Decimal(0), Decimal(0)

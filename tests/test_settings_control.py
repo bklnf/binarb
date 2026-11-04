@@ -59,16 +59,26 @@ def test_telegram_status_includes_total_usd(tmp_path, monkeypatch):
     assert "💎 BNB fee discount: ON" in text
 
 
+def test_status_shows_maintenance_rejection_without_hiding_it_as_no_error(tmp_path, monkeypatch):
+    monkeypatch.setenv('ARB_CONTROL_ROOT_BINANCE', str(tmp_path))
+    text = status_text(Settings.load(), {
+        'rebalance_status': 'REBALANCE_PARTIAL',
+        'rebalance_error': 'ETHTRY: This symbol is not permitted for this account.',
+    })
+    assert '⚠️ Rebalance error: ETHTRY: This symbol is not permitted for this account.' in text
+
+
 def test_bnb_fee_reserve_replenishes_only_below_floor():
     class Client:
         def __init__(self): self.active, self.budget = None, None
         def set_bnb_discount_active(self, active): self.active = active
         def edge(self, source, target, tickers):
-            return Edge(source, target, "BNBUSDT", "buy", Decimal("600"), Decimal(0))
+            assert (source, target) == ("USDC", "BNB")
+            return Edge(source, target, "BNBUSDC", "buy", Decimal("600"), Decimal(0))
         def prepare_market_order(self, edge, budget): return {"quoteOrderQty": str(budget)}
         def new_market_order(self, edge, budget, token):
             self.budget = budget
-            return Fill(1, token, "FILLED", "BNBUSDT", "BUY", Decimal(".013"), budget)
+            return Fill(1, token, "FILLED", "BNBUSDC", "BUY", Decimal(".013"), budget)
 
     class SettingsStub:
         use_bnb_fee_discount = True
@@ -79,11 +89,12 @@ def test_bnb_fee_reserve_replenishes_only_below_floor():
 
     client = Client()
     active = maintain_bnb_fee_reserve(client, SettingsStub(),
-                                      {"BNBUSDT": (Decimal("600"), Decimal("601"))},
-                                      {"BNB": Decimal(".003"), "USDT": Decimal("12")})
+                                      {"BNBUSDT": (Decimal("600"), Decimal("601")),
+                                       "USDCUSDT": (Decimal(".98"), Decimal(".99"))},
+                                      {"BNB": Decimal(".003"), "USDC": Decimal("12")})
     assert active is False
     assert client.active is False
-    assert client.budget == Decimal("8.2")
+    assert client.budget == Decimal("8.2") / Decimal(".98")
 
 
 def test_account_restricted_symbols_are_persisted_and_seeded_from_history(tmp_path):
@@ -101,8 +112,25 @@ def test_account_restricted_symbols_are_persisted_and_seeded_from_history(tmp_pa
     ("ARB_DRY_RUN_BINANCE", "flase"), ("ARB_TICKER_MAX_AGE_S_BINANCE", "nan"),
     ("ARB_SCAN_INTERVAL_MS_BINANCE", "0"), ("ARB_MIN_NET_BPS_BINANCE", "NaN"),
     ("ARB_QUOTE_MAX_SKEW_S_BINANCE", "3"), ("ARB_ARCHIVE_MAX_FILES_BINANCE", "0"),
+    ("ARB_REBALANCE_INTERVAL_S_BINANCE", "0"), ("ARB_REBALANCE_THRESHOLD_BINANCE", "NaN"),
+    ("ARB_REBALANCE_THRESHOLD_BINANCE", "1"),
 ])
 def test_invalid_safety_configuration_fails_closed(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError):
         Settings.load()
+
+
+def test_rebalance_requires_usdc_only_and_a_bnb_reserve(monkeypatch):
+    monkeypatch.setenv('ARB_REBALANCE_ENABLED_BINANCE', 'true')
+    monkeypatch.setenv('ARB_START_CURRENCIES_BINANCE', 'USDC')
+    monkeypatch.setenv('ARB_USE_BNB_FEE_DISCOUNT_BINANCE', 'true')
+    monkeypatch.setenv('ARB_BNB_REPLENISH_ENABLED_BINANCE', 'true')
+    assert Settings.load().rebalance_interval_s == 300
+    monkeypatch.setenv('ARB_START_CURRENCIES_BINANCE', 'USDT,BNB')
+    with pytest.raises(ValueError): Settings.load()
+
+
+def test_default_start_is_usdc(monkeypatch):
+    monkeypatch.delenv('ARB_START_CURRENCIES_BINANCE', raising=False)
+    assert Settings.load().start_currencies == ('USDC',)

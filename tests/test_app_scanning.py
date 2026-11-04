@@ -118,3 +118,26 @@ def test_research_can_check_old_tickers_but_cannot_accept_old_depth():
                                  research_quote_limits=(30, 30))
     assert candidate is None
     assert stats['rejection_codes'] == {'DEPTH_STALE_QUOTES': 1}
+
+
+def test_default_scan_only_funds_triangles_starting_and_ending_in_usdc(monkeypatch):
+    client = Client()
+    for symbol, meta in list(client.pairs.items()):
+        if meta.quote == 'USDT':
+            usdc_symbol = symbol.replace('USDT', 'USDC')
+            client.pairs[usdc_symbol] = replace(meta, symbol=usdc_symbol, quote='USDC')
+            client.prices[usdc_symbol] = client.prices[symbol]
+            client.fees[usdc_symbol] = Decimal(0)
+    client.edge = lambda *args: None  # USD scoring is optional for this fixture.
+    monkeypatch.delenv('ARB_START_CURRENCIES_BINANCE', raising=False)
+    config = Settings.load()
+    candidate, stats = find_best(client, config, client.tickers(),
+                                 {'USDC': Decimal('10.99'), 'USDT': Decimal(1000)})
+    assert candidate is not None
+    assert candidate.route[0] == candidate.route[-1] == 'USDC'
+    assert stats['balances'] == {'USDC': '10.99'}
+    assert not any(symbol.endswith('USDT') for symbol in client.calls)
+    client.calls.clear()
+    candidate, _ = find_best(client, config, client.tickers(), {'USDT': Decimal(1000)})
+    assert candidate is None
+    assert not client.calls
